@@ -112,6 +112,21 @@ class TSCeptionParams:
     dropout: float = 0.5
 
 
+@dataclass
+class CCNNParams:
+    in_channels: int = 4
+    grid_size: tuple = (9, 9)
+    dropout: float = 0.5
+
+
+# =============================================
+# DEAP 数据集配置
+# =============================================
+DEAP_NUM_CHANNELS = 32
+DEAP_SAMPLING_RATE = 128
+DEAP_NUM_CLASSES = 2  # valence high/low binary
+
+
 # =============================================
 # 默认配置实例
 # =============================================

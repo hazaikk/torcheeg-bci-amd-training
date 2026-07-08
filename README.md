@@ -1,44 +1,46 @@
-# BCICIV2a TorchEEG Training — AMD Developer Cloud
+# BCICIV2a + DEAP TorchEEG Training — AMD Developer Cloud
 
 > 在 [AMD Radeon™ Cloud (anruicloud.com)](https://radeon.anruicloud.com/) 上使用免费 GPU 额度，
-> 训练 TorchEEG CNN 模型，自动下载 BCICIV2a 数据集，生成完整训练报告。
+> 训练 TorchEEG CNN 模型，支持 **BCICIV2a (运动想象)** 和 **DEAP (情感识别)** 双数据集。
 
 ## 📁 项目结构
 
 ```
 cloud_amd_training/
-├── BCICIV2a_TorchEEG_Training.ipynb  # ★ 主 Notebook (训练 + 可视化, AMD Cloud 入口)
-├── TorchEEG_Feature_Test.ipynb       # ★ TorchEEG 功能测试 (7 项)
-├── quick_start.ipynb                 # 快速验证 (3 步)
-├── preprocess_dataset.py          # ★ 数据集预处理 (持久化.pt, 加速训练)
-├── train.py                       # ★ 主训练脚本 (LOSO 交叉验证, 全部模型)
-├── test_torcheeg_features.py      # ★ TorchEEG 功能全面测试 (7 项)
-├── train_torcheeg_native.py       # TorchEEG 原生 API 使用示例
-├── download_data.py               # 数据自动下载 (BNCI Horizon 2020)
-├── config.py                      # 集中配置 (超参数, 路径)
-├── requirements.txt               # Python 依赖
-├── run_training.sh                # AMD Cloud 一键运行脚本
-├── create_github_upload.py        # GitHub 上传打包工具
-├── preprocess_dataset.py          # 数据集预处理脚本
-├── utils/
-│   ├── data_utils.py              # 数据加载与预处理
-│   ├── model_utils.py             # 模型工厂 + 设备检测
-│   └── vis_utils.py               # 可视化 + 报告生成 (含 t-SNE)
-├── results/                       # 输出目录 (自动生成)
-│   ├── TRAINING_REPORT.md         # ★ 完整训练报告
-│   ├── model_comparison.png       # 模型对比图
-│   ├── results.json               # 全部数值结果
-│   ├── *_curves.png               # 训练曲线 (各受试者)
-│   ├── *_cm.png                   # 混淆矩阵 (各受试者)
-│   ├── *_tsne.png                 # t-SNE 特征可视化
-│   ├── transform_comparison.png   # Transforms 对比
-│   ├── optimizer_comparison.png   # 优化器对比
-│   └── feature_tests/             # test_torcheeg_features.py 输出
-├── data/                          # 数据集 (自动下载)
-│   ├── BCICIV2a.mat              # 预组装文件 (5184 样本)
-│   ├── A01T.mat ~ A09E.mat       # 单受试者文件
-│   └── torcheeg_cache/            # TorchEEG 原生缓存
-└── README.md                      # ★ 本文档
+│
+├── BCICIV2a 运动想象
+│   ├── BCICIV2a_TorchEEG_Training.ipynb  # ★ 主 Notebook (训练 + 可视化)
+│   ├── train.py                       # ★ 主训练脚本 (LOSO, 全部模型)
+│   ├── preprocess_dataset.py          # ★ 预处理 (持久化.pt)
+│   ├── download_data.py               # 自动下载 (BNCI Horizon 2020)
+│   └── train_torcheeg_native.py       # TorchEEG 原生 API 示例
+│
+├── DEAP 情感识别 (新增)
+│   ├── train_deap.py                  # ★ DEAP 训练脚本 (Table 1 复现)
+│   ├── preprocess_deap.py             # ★ DEAP 预处理 (持久化.pt)
+│   └── download_deap.py               # 自动下载 (KaggleHub)
+│
+├── 通用
+│   ├── config.py                      # 集中配置 (超参数, 路径)
+│   ├── test_torcheeg_features.py      # TorchEEG 功能测试 (7 项)
+│   ├── quick_start.ipynb              # 快速验证 (3 步)
+│   ├── TorchEEG_Feature_Test.ipynb    # TorchEEG 功能测试 Notebook
+│   ├── requirements.txt               # Python 依赖
+│   ├── run_training.sh                # AMD Cloud 一键运行脚本
+│   ├── check_gpu.py                   # GPU 诊断
+│   ├── utils/
+│   │   ├── data_utils.py              # 数据加载
+│   │   ├── model_utils.py             # 模型工厂 + 设备检测
+│   │   ├── training_strategies.py     # 早停 + LR 调度
+│   │   ├── fixes.py                   # 兼容性修复
+│   │   ├── vis_utils.py               # 可视化
+│   │   └── __init__.py
+│   └── results/                       # 输出目录 (自动生成)
+├── data/                              # 数据集 (自动下载)
+│   ├── BCICIV2a.mat                  # BCIC 预组装
+│   ├── A01T.mat ~ A09E.mat           # BCIC 单受试者
+│   └── deap/                          # DEAP (s01.dat ~ s32.dat)
+└── README.md
 ```
 
 ## 🚀 AMD Developer Cloud 快速开始
@@ -110,6 +112,89 @@ tar czf results.tar.gz results/
 # 或直接在 Jupyter 中通过右键下载
 ```
 
+---
+
+## 🧠 DEAP 情感识别 (Table 1 复现)
+
+在 DEAP 数据集上复现 [TorchEEG EMO 论文](https://arxiv.org/abs/2401.14571) Table 1 的 Valence 二分类准确率。
+
+### 数据集: DEAP
+
+- 32 名受试者, 40 段 63s 视频刺激
+- 32 EEG 通道 + 8 外周生理通道, 128Hz 采样率
+- 评分维度: valence / arousal / dominance / liking (1-9 连续值)
+- 任务: **Valence 二分类** (high > 5 vs low ≤ 5)
+
+### 支持模型
+
+| 模型 | 参数量 | 输入格式 | 备注 |
+|------|--------|---------|------|
+| **EEGNet** | 1.7K | (1, 32, T) | 深度可分离卷积 |
+| **TSCeption** | 13.9K | (1, 32, T) | Inception 多尺度时域 |
+| **FBCNet** | 12.4K | (9, 32, T) | 9频带并行 + LogVar |
+| **FBMSNet** | 16.8K | (9, 32, T) | 多尺度频带分解 |
+| **CCNN** | 6.2M | (T, 9, 9) 网格 | 紧凑型 2D CNN |
+
+### 快速开始
+
+```bash
+# 1. 安装依赖 (KaggleHub)
+pip install kagglehub
+
+# 2. 下载 DEAP 数据集
+python download_deap.py
+# 或指定目录:
+python download_deap.py --data-dir ./data/deap
+
+# 3. 【推荐】预处理 (只需跑一次, 将 transforms 结果存为 .pt)
+#    支持 1 秒 (128pt) 和 2 秒 (256pt) 窗口
+python preprocess_deap.py --models all --chunk-size 128
+python preprocess_deap.py --models all --chunk-size 256
+
+# 4. 训练 (预处理模式, 最快 — 跳过所有 transforms)
+python train_deap.py --models EEGNet TSCeption --use-preprocessed
+
+# 5. 原生模式 (TorchEEG DEAPDataset + 自动 LMDB 缓存)
+python train_deap.py --models FBCNet FBMSNet --chunk-size 128 --cv kfold_groupby_trial
+
+# 6. 快速测试 (1 epoch, 2 folds)
+python train_deap.py --models EEGNet --test
+
+# 7. 多模型 + 不同交叉验证策略
+python train_deap.py --models all --cv leave_one_subject_out
+python train_deap.py --models EEGNet FBCNet --cv kfold --n-splits 10
+python train_deap.py --models all --chunk-size 256 --cv kfold_per_subject_groupby_trial
+```
+
+### 复现论文 Table 1
+
+```bash
+# 1 秒窗口 + KFoldGroupbyTrial (5折)
+python preprocess_deap.py --models all --chunk-size 128
+python train_deap.py --models all --chunk-size 128 --cv kfold_groupby_trial --use-preprocessed
+```
+
+### 交叉验证策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| `kfold_groupby_trial` (默认) | 按 trial 分组 KFold | **论文 Table 1** |
+| `kfold` | 常规 KFold | 通用 |
+| `kfold_per_subject_groupby_trial` | 每受试者内按 trial 分组 | 受试者独立评估 |
+| `leave_one_subject_out` | 留一受试者交叉验证 | 跨受试者泛化 |
+
+### 输出格式
+
+训练结果保存在 `results/DEAP_<窗口>_<策略>_<时间戳>/` 下:
+- `config.json` — 训练配置
+- `<模型>/summary.json` — 指标汇总 (mean/std/best acc)
+- `<模型>/best_model.pt` — 最佳模型权重
+- `<模型>/all_epochs.csv` — 全部 epoch 的 train/val 指标
+- `<模型>/fold_N_metrics.csv` — 每折详细指标
+- `table1_summary.csv` — 所有模型汇总表
+
+---
+
 ## 🧪 TorchEEG 功能测试矩阵
 
 | 测试编号 | 测试内容 | 涵盖模块 |
@@ -122,7 +207,7 @@ tar czf results.tar.gz results/
 | Test 6 | 评价度量 | Acc, Balanced Acc, Kappa, F1, Precision, Recall, AUC-OVR |
 | Test 7 | 完整 LOSO + 报告 | 9 受试者 LOSO, 生成完整 Markdown 报告 |
 
-## 🧠 支持模型
+## 🧠 支持模型 (BCICIV2a)
 
 | 模型 | 类型 | 参数量 | 关键特性 |
 |------|------|--------|---------|
@@ -130,6 +215,8 @@ tar czf results.tar.gz results/
 | **TSCeption** | 时序CNN | ~12K | Inception 多尺度时域卷积 |
 | **FBCNet** | 频带 CNN | ~12K | 多频带并行 + LogVar 时域聚合 |
 | **FBMSNet** | 多尺度 CNN | ~16K | 多尺度频带分解 |
+| **CSPNet** | 混合 CNN | ~10K | 时空卷积组合 |
+| **LMDA** | 轻量 CNN | ~15K | 通道+深度注意力 |
 
 ## 📊 输出说明
 
