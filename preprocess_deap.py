@@ -93,6 +93,9 @@ def precompute_transforms(data: np.ndarray, transform,
                            model_name: str, chunk_size: int,
                            batch_size: int = 256,
                            device: str = 'cpu') -> torch.Tensor:
+    # FBCNet/FBMSNet 的 BandSignal 内存占用大, 缩小 batch
+    if model_name in ('FBCNet', 'FBMSNet'):
+        batch_size = min(batch_size, 128)
     """对完整数据集批量预应用 transforms
 
     Args:
@@ -107,11 +110,12 @@ def precompute_transforms(data: np.ndarray, transform,
         torch.float32 tensor
     """
     n = len(data)
-    print(f'[PREP] {model_name}: transforming {n} samples...',
-          end='', flush=True)
     t0 = time.time()
+    print(f'[PREP] {model_name}: transforming {n} samples...', flush=True)
 
     transformed_batches = []
+    log_interval = max(1, n // 20)  # 每 5% 打印一次
+
     for i in range(0, n, batch_size):
         batch = data[i:i + batch_size]
         batch_out = []
@@ -121,14 +125,25 @@ def precompute_transforms(data: np.ndarray, transform,
         tb = torch.stack(batch_out).contiguous().float()
         transformed_batches.append(tb)
 
+        # 进度输出
+        processed = min(i + batch_size, n)
+        if processed % log_interval == 0 or processed == n:
+            elapsed = time.time() - t0
+            speed = processed / elapsed if elapsed > 0 else 0
+            remaining = (n - processed) / speed if speed > 0 else 0
+            print(f'  [{processed}/{n}] {100*processed//n}%  '
+                  f'{speed:.0f} samples/s  '
+                  f'est: {remaining/60:.1f}min remaining',
+                  flush=True)
+
     result = torch.cat(transformed_batches, dim=0)
     elapsed = time.time() - t0
 
     if device != 'cpu':
         result = result.to(device)
 
-    print(f' done ({elapsed:.1f}s), shape={tuple(result.shape)}, '
-          f'dtype={result.dtype}')
+    print(f'[PREP] {model_name} done ({elapsed:.1f}s), '
+          f'shape={tuple(result.shape)}, dtype={result.dtype}')
     return result
 
 
