@@ -9,11 +9,11 @@
 torch>=2.0.0
 numpy>=1.24.0
 
-# scipy — Python 3.12 需 scipy>=1.12.0
-# torcheeg 官方要求 scipy>=1.7.3,<=1.10.1 但该约束与 Python 3.12 冲突。
-# 解决方法: 先装 scipy (不限版本), 再装 torcheeg 时加 --no-deps 跳过依赖检查。
+# scipy — 不在此指定版本, 避免与 torcheeg 的 scipy<=1.10.1 约束冲突
+# Python 3.12 需 scipy>=1.12.0, 需特殊处理:
+#   pip install scipy --upgrade
+#   pip install torcheeg --no-deps
 # 脚本 run_training.sh 已自动处理, 见注释.
-scipy>=1.12.0
 
 # TorchEEG (EEG 深度学习工具箱)
 # 注意: Python 3.12 下需加 --no-deps 安装 (因 scipy 版本约束冲突)
