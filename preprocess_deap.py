@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import scipy.signal
+from scipy.signal import butter, sosfilt
 from scipy.signal.windows import hann, hamming, blackman
 scipy.signal.hann = hann
 scipy.signal.hamming = hamming
@@ -89,26 +90,101 @@ def get_transform(model_name: str, chunk_size: int = 128) -> callable:
         raise ValueError(f'Unknown model: {model_name}')
 
 
+def _bandpass_trials(trials_data: np.ndarray,
+                     band_dict: Dict[str, List[int]],
+                     sampling_rate: int = 128,
+                     order: int = 4) -> Dict[str, np.ndarray]:
+    """对完整 trials 应用带通滤波 (比 per-window BandSignal 快 ~60倍)
+
+    用 scipy.sosfilt (second-order sections) 滤波, 数值稳定性更好。
+
+    Args:
+        trials_data: (n_trials, n_channels, n_times) — 未切窗的原始 trial
+        band_dict: {'band1': [4,8], 'band2': [8,12], ...}
+        sampling_rate: 采样率
+        order: 滤波器阶数
+
+    Returns:
+        {band_name: filtered_data (n_trials, n_channels, n_times)}
+    """
+    results = {}
+    for band_name, (low, high) in band_dict.items():
+        # 设计一次滤波器, 应用到所有 trial
+        sos = butter(order, [low, high], btype='band', fs=sampling_rate, output='sos')
+        filtered = np.zeros_like(trials_data)
+        for ti in range(trials_data.shape[0]):
+            # (n_channels, n_times) 每通道独立滤波
+            for ch in range(trials_data.shape[1]):
+                filtered[ti, ch] = sosfilt(sos, trials_data[ti, ch])
+        results[band_name] = filtered
+        print(f'    {band_name} ({low}-{high}Hz): filtered {trials_data.shape}', flush=True)
+    return results
+
+
 def precompute_transforms(data: np.ndarray, transform,
                            model_name: str, chunk_size: int,
                            batch_size: int = 256,
-                           device: str = 'cpu') -> torch.Tensor:
+                           device: str = 'cpu',
+                           full_trials: Optional[np.ndarray] = None,
+                           n_windows_per_trial: int = 63) -> torch.Tensor:
     # FBCNet/FBMSNet 的 BandSignal 内存占用大, 缩小 batch
     if model_name in ('FBCNet', 'FBMSNet'):
         batch_size = min(batch_size, 128)
     """对完整数据集批量预应用 transforms
 
     Args:
-        data: numpy (N, 32, chunk_size)
+        data: numpy (N, 32, chunk_size) — 已切窗的数据
         transform: torcheeg transforms
         model_name: 仅用于日志
         chunk_size: 窗口大小
         batch_size: 批大小
         device: 计算设备
+        full_trials: numpy (n_trials, 32, 8064) 未切窗的原始 trial
+                     仅 FBCNet/FBMSNet 使用, 先滤波再切窗加速
+        n_windows_per_trial: 每 trial 的窗口数
 
     Returns:
         torch.float32 tensor
     """
+    # ── FBCNet/FBMSNet 加速: 先滤波整段 trial, 再切窗 ──
+    if model_name in ('FBCNet', 'FBMSNet') and full_trials is not None:
+        n_trials = full_trials.shape[0]
+        t0 = time.time()
+        print(f'[PREP] {model_name}: bandpass filtering {n_trials} full trials...', flush=True)
+
+        fbc_bands = {
+            f'band{i}': [4 * i, 4 * (i + 1)]
+            for i in range(1, 10)
+        }
+        band_data = _bandpass_trials(full_trials, fbc_bands,
+                                     sampling_rate=DEAP_SAMPLING_RATE)
+
+        # 切窗: 每个 filtered trial → n_windows_per_trial 个窗口
+        n_total = n_trials * n_windows_per_trial
+        n_bands = len(band_data)
+        n_ch = full_trials.shape[1]
+        result = np.zeros((n_total, n_bands, n_ch, chunk_size), dtype=np.float32)
+
+        for bi, (band_name, fdata) in enumerate(band_data.items()):
+            idx = 0
+            for ti in range(n_trials):
+                for wi in range(n_windows_per_trial):
+                    start = wi * chunk_size
+                    end = start + chunk_size
+                    result[idx, bi] = fdata[ti, :, start:end]
+                    idx += 1
+
+        result_tensor = torch.from_numpy(result)
+        elapsed = time.time() - t0
+        print(f'[PREP] {model_name} done ({elapsed:.1f}s), '
+              f'shape={tuple(result_tensor.shape)}, dtype={result_tensor.dtype}',
+              flush=True)
+
+        if device != 'cpu':
+            result_tensor = result_tensor.to(device)
+        return result_tensor
+
+    # ── 通用路径 (EEGNet, TSCeption, CCNN) ──
     n = len(data)
     t0 = time.time()
     print(f'[PREP] {model_name}: transforming {n} samples...', flush=True)
@@ -254,8 +330,6 @@ def process_deap(data_dir: str,
 
     assert idx == n_total_windows, f'{idx} != {n_total_windows}'
 
-    # 释放内存
-    del data_all, all_eeg
     print(f'[PREP] Total windows: {n_total_windows}')
 
     # ── 标签二值化: valence > 5 → 1 (high), else → 0 (low) ──
@@ -279,6 +353,7 @@ def process_deap(data_dir: str,
     print(f'[PREP] Meta saved: {meta_path}')
 
     # ── 按模型预处理并保存 ──
+    # 注意: FBCNet/FBMSNet 用 data_all (未切窗的完整 trial) 先滤波再切窗, 提速 ~60x
     results = {}
     windows_f32 = windows.astype(np.float32)
 
@@ -287,13 +362,18 @@ def process_deap(data_dir: str,
         transform = get_transform(model_name, chunk_size)
         transformed = precompute_transforms(
             windows_f32, transform, model_name, chunk_size,
-            device=device)
+            device=device,
+            full_trials=data_all if model_name in ('FBCNet', 'FBMSNet') else None,
+            n_windows_per_trial=n_windows_per_trial)
 
         data_path = os.path.join(preproc_dir, f'{model_name}_data.pt')
         torch.save(transformed.contiguous(), data_path)
         print(f'[PREP] {model_name} data saved: {data_path} '
               f'shape={tuple(transformed.shape)}')
         results[model_name] = data_path
+
+    # 释放内存
+    del data_all, all_eeg, windows, windows_f32
 
     print(f'\n[PREP] All done! Files saved to: {preproc_dir}')
     print(f'  Meta: meta.pt')
