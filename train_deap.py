@@ -469,13 +469,20 @@ def run_experiment(
     use_preprocessed: bool = False,
     preproc_dir: str = '',
     test_mode: bool = False,
+    test_ratio: float = 0.0,
     verbose: bool = True,
 ) -> Dict:
     """运行 DEAP 实验
 
-    当 use_preprocessed=True 时, 使用 preprocess_deap.py 生成的 .pt 文件,
-    跳过 DEAPDataset, 适用于快速重复训练.
-    否则使用 TorchEEG DEAPDataset (自动缓存).
+    当 test_ratio > 0 时:
+      1. 先按 subject 划分 held-out test set (如 20%)
+      2. 剩余数据做 K-fold CV (train/val)
+      3. CV 结束后用最佳模型在 test set 上评估
+      最终指标以 test accuracy 为准。
+
+    当 test_ratio = 0: 纯 K-fold CV, 以 val 均值为准 (论文 Table 1 方式)。
+
+    use_preprocessed=True: 加载 .pt 文件, 最快模式.
     """
     if use_preprocessed:
         # ── 预处理模式 (最快) ──
@@ -504,35 +511,57 @@ def run_experiment(
             print(f'\n[DEAP] Preprocessed: {n_total} samples ({model_name})')
             print(f'       Shape: {tuple(data.shape)}, Class: {dict(cls_counts)}')
 
+        # ── 持出 test set (按 subject 划分) ──
+        test_subject_ids = None
+        if test_ratio > 0 and use_preprocessed:
+            unique_subjects = sorted(subjects.unique().tolist())
+            n_test = max(1, int(len(unique_subjects) * test_ratio))
+            np.random.seed(42)
+            test_subject_ids = set(np.random.choice(unique_subjects, n_test, replace=False).tolist())
+            train_val_subjects = [s for s in unique_subjects if s not in test_subject_ids]
+            if verbose:
+                print(f'       Hold-out test: {len(test_subject_ids)} subjects {sorted(test_subject_ids)}')
+                print(f'       Train/Val:     {len(train_val_subjects)} subjects')
+        else:
+            train_val_subjects = sorted(subjects.unique().tolist())
+
         # 按 subject 的 KFold 分组
-        unique_subjects = sorted(subjects.unique().tolist())
         if cv_strategy == 'leave_one_subject_out':
-            fold_subject_groups = [[s] for s in unique_subjects]
+            fold_subject_groups = [[s] for s in train_val_subjects]
         elif 'kfold' in cv_strategy:
             np.random.seed(42)
-            shuffled = unique_subjects.copy()
+            shuffled = train_val_subjects.copy()
             np.random.shuffle(shuffled)
-            fold_subject_groups = np.array_split(shuffled, n_splits)
+            fold_subject_groups = np.array_split(shuffled, min(n_splits, len(shuffled)))
             fold_subject_groups = [g.tolist() if hasattr(g, 'tolist') else list(g)
                                    for g in fold_subject_groups]
         else:
-            fold_subject_groups = np.array_split(unique_subjects, n_splits)
+            fold_subject_groups = np.array_split(train_val_subjects, n_splits)
             fold_subject_groups = [g.tolist() if hasattr(g, 'tolist') else list(g)
                                    for g in fold_subject_groups]
 
         fold_indices = []
-        for test_subjects in fold_subject_groups:
-            train_mask = ~torch.isin(subjects, torch.tensor(test_subjects))
-            test_mask = torch.isin(subjects, torch.tensor(test_subjects))
+        for val_subjects in fold_subject_groups:
+            train_mask = ~torch.isin(subjects, torch.tensor(val_subjects))
+            if test_subject_ids:
+                # 也从 train 中排除 test subjects
+                test_mask_tensor = torch.tensor(list(test_subject_ids))
+                train_mask = train_mask & ~torch.isin(subjects, test_mask_tensor)
+            val_mask = torch.isin(subjects, torch.tensor(val_subjects))
             train_idx = torch.where(train_mask)[0]
-            test_idx = torch.where(test_mask)[0]
+            val_idx = torch.where(val_mask)[0]
 
-            # 校验: 确保 train 和 test 无重合 subject
+            if len(train_idx) == 0 or len(val_idx) == 0:
+                continue
+
+            # 校验: 确保 train/val/test 无重叠
             train_subs = set(subjects[train_idx].tolist())
-            test_subs = set(subjects[test_idx].tolist())
-            assert train_subs & test_subs == set(), \
-                f'Subject overlap: {train_subs & test_subs}'
-            fold_indices.append((train_idx, test_idx))
+            val_subs = set(subjects[val_idx].tolist())
+            assert train_subs & val_subs == set(), f'Overlap: {train_subs & val_subs}'
+            if test_subject_ids:
+                assert train_subs & test_subject_ids == set(), f'Train-test overlap!'
+                assert val_subs & test_subject_ids == set(), f'Val-test overlap!'
+            fold_indices.append((train_idx, val_idx))
 
         # 清理内存
         if device != 'cpu':
@@ -699,6 +728,53 @@ def run_experiment(
             fold_csv = os.path.join(run_dir, f'fold_{fold_idx+1}_metrics.csv')
             pd.DataFrame(fold_metrics).to_csv(fold_csv, index=False)
 
+    # ── 在 hold-out test set 上评估 ──
+    test_metrics = None
+    if test_subject_ids and best_model_state is not None and use_preprocessed:
+        print(f'\n  {"="*60}')
+        print(f'  Evaluating on held-out test set ({len(test_subject_ids)} subjects)...')
+        print(f'  {"="*60}')
+
+        # 用最佳模型参数重新建模型
+        test_model = get_model(model_name, num_classes=DEAP_NUM_CLASSES,
+                               chunk_size=chunk_size)
+        test_model.load_state_dict(best_model_state)
+        test_model = test_model.to(device)
+        test_criterion = get_criterion(model_name)
+
+        # 构建 test dataset (只需对应 subject 的数据)
+        test_mask = torch.isin(subjects, torch.tensor(list(test_subject_ids)))
+        test_data = data[test_mask]
+        test_lbls = labels[test_mask]
+        test_subs = subjects[test_mask]
+
+        test_dataset = CombinedDEAPDataset(test_data, test_lbls, test_subs)
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size,
+            shuffle=False, num_workers=0, drop_last=False)
+
+        test_metrics = evaluate(test_model, test_loader, test_criterion, device)
+        print(f'  Test acc:  {test_metrics["acc"]:.2f}%')
+        print(f'  Test f1:   {test_metrics["f1"]:.2f}%')
+        print(f'  Test loss: {test_metrics["loss"]:.4f}')
+        print(f'  Test CM:\n{np.array(test_metrics["cm"])}')
+
+        # 保存 predictions
+        test_model.eval()
+        all_preds, all_gt = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                inp = batch[0].to(device)
+                out = test_model(inp)
+                _, pred = torch.max(out, 1)
+                all_preds.extend(pred.cpu().tolist())
+                all_gt.extend(batch[1].tolist())
+        if run_dir:
+            np.savez(os.path.join(run_dir, 'test_predictions.npz'),
+                     predictions=all_preds, ground_truth=all_gt)
+
+        del test_model
+
     # ── 汇总 ──
     val_accs = [r['best_val_acc'] for r in fold_results]
     summary = {
@@ -713,19 +789,26 @@ def run_experiment(
         'scheduler': scheduler_name,
         'use_preprocessed': use_preprocessed,
         'test_mode': test_mode,
+        'test_ratio': test_ratio,
         'fold_results': fold_results,
         'mean_val_acc': round(float(np.mean(val_accs)), 2),
         'std_val_acc': round(float(np.std(val_accs)), 2),
         'best_val_acc': round(float(np.max(val_accs)), 2),
     }
+    if test_metrics:
+        summary['test_acc'] = round(test_metrics['acc'], 2)
+        summary['test_f1'] = round(test_metrics['f1'], 2)
+        summary['test_loss'] = round(test_metrics['loss'], 4)
 
     if verbose:
         print(f'\n{"="*60}')
         print(f'  {model_name} — {cv_strategy} ({n_folds}-fold)')
         print(f'  Window: {chunk_size}pt')
-        print(f'  Per-fold: {[f"{a:.2f}" for a in val_accs]}')
-        print(f'  Mean±Std: {summary["mean_val_acc"]:.2f}±{summary["std_val_acc"]:.2f}')
-        print(f'  Best: {summary["best_val_acc"]:.2f}%')
+        if test_metrics:
+            print(f'  Test acc: {test_metrics["acc"]:.2f}%  (held-out {len(test_subject_ids)} subjects)')
+        print(f'  CV Per-fold: {[f"{a:.2f}" for a in val_accs]}')
+        print(f'  CV Mean±Std: {summary["mean_val_acc"]:.2f}±{summary["std_val_acc"]:.2f}')
+        print(f'  CV Best: {summary["best_val_acc"]:.2f}%')
         print(f'{"="*60}')
 
     # ── 保存 ──
@@ -781,6 +864,8 @@ def parse_args():
     p.add_argument('--results-dir', type=str, default=RESULTS_DIR)
     p.add_argument('--test', action='store_true',
                     help='快速测试模式 (1 epoch, 2 folds)')
+    p.add_argument('--test-ratio', type=float, default=0.0,
+                    help='held-out test set 比例 (如 0.2=20% subjects 做最终测试)')
     p.add_argument('--quiet', action='store_true')
     return p.parse_args()
 
@@ -874,7 +959,9 @@ def main():
             device=device, run_dir=model_dir,
             use_preprocessed=args.use_preprocessed,
             preproc_dir=deap_root if args.use_preprocessed else '',
-            test_mode=args.test, verbose=verbose,
+            test_mode=args.test,
+            test_ratio=args.test_ratio,
+            verbose=verbose,
         )
         all_summaries.append(summary)
 
@@ -884,22 +971,37 @@ def main():
     print(f'  Window: {args.chunk_size}pt ({args.chunk_size/DEAP_SAMPLING_RATE:.0f}s)')
     print(f'  CV: {args.cv}{" (TEST)" if args.test else ""}')
     print(f'{"="*65}')
-    print(f'  {"Model":<12s}  {"Mean":<7s}  {"Std":<7s}  {"Best":<7s}')
-    print(f'  {"-"*35}')
-    for s in all_summaries:
-        if 'error' in s:
-            print(f'  {s["model"]:<12s}  ERROR')
-        else:
-            print(f'  {s["model"]:<12s}  {s["mean_val_acc"]:<6.2f}%  '
-                  f'{s["std_val_acc"]:<5.2f}%  {s["best_val_acc"]:<6.2f}%')
+    has_test = any(s.get('test_acc') for s in all_summaries)
+    if has_test:
+        print(f'  {"Model":<12s}  {"CV Mean":<8s}  {"Test Acc":<9s}  {"Test F1":<8s}')
+        print(f'  {"-"*42}')
+        for s in all_summaries:
+            if 'error' in s:
+                print(f'  {s["model"]:<12s}  ERROR')
+            else:
+                ta = s.get('test_acc', 0)
+                tf1 = s.get('test_f1', 0)
+                print(f'  {s["model"]:<12s}  {s["mean_val_acc"]:<6.2f}%   '
+                      f'{ta:<6.2f}%    {tf1:<6.2f}%')
+    else:
+        print(f'  {"Model":<12s}  {"CV Mean":<8s}  {"Std":<7s}  {"Best":<7s}')
+        print(f'  {"-"*35}')
+        for s in all_summaries:
+            if 'error' in s:
+                print(f'  {s["model"]:<12s}  ERROR')
+            else:
+                print(f'  {s["model"]:<12s}  {s["mean_val_acc"]:<6.2f}%   '
+                      f'{s["std_val_acc"]:<5.2f}%  {s["best_val_acc"]:<6.2f}%')
     print(f'{"="*65}')
 
     table_path = os.path.join(results_dir, 'table1_summary.csv')
     rows = [{
         'Model': s['model'],
-        'Mean_Acc': s.get('mean_val_acc', 0),
-        'Std': s.get('std_val_acc', 0),
-        'Best_Acc': s.get('best_val_acc', 0),
+        'CV_Mean_Acc': s.get('mean_val_acc', 0),
+        'CV_Std': s.get('std_val_acc', 0),
+        'CV_Best_Acc': s.get('best_val_acc', 0),
+        'Test_Acc': s.get('test_acc', ''),
+        'Test_F1': s.get('test_f1', ''),
         'CV': s.get('cv_strategy', args.cv),
         'Window_pts': s.get('chunk_size', args.chunk_size),
     } for s in all_summaries if 'error' not in s]
