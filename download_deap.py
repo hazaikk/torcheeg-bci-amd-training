@@ -59,20 +59,37 @@ def download_via_kagglehub(kaggle_cache_dir: Optional[str] = None) -> str:
 
     print(f'[DEAP] Downloaded to: {dataset_path}')
 
-    # 确认数据文件存在
+    # 确认数据文件存在 — kagglehub 返回版本目录, 实际数据可能在子目录中
+    # 常见结构: versions/1/deap-dataset/data_preprocessed_python/
     data_dir = os.path.join(dataset_path, DATASET_SUBDIR)
     if not os.path.exists(data_dir):
-        # 直接检查下载目录
+        # 尝试在子目录中查找
         contents = os.listdir(dataset_path)
         print(f'[DEAP] Contents of {dataset_path}: {contents}')
+        found = False
         for d in contents:
             sub = os.path.join(dataset_path, d)
             if os.path.isdir(sub):
                 sub_contents = os.listdir(sub)
-                print(f'  {d}/: {sub_contents[:5]}...')
-        raise FileNotFoundError(
-            f'Expected {DATASET_SUBDIR} not found in {dataset_path}. '
-            f'Please check the dataset structure.')
+                print(f'  {d}/: {sub_contents[:10]}...')
+                # 检查子目录中是否包含 data_preprocessed_python
+                candidate = os.path.join(sub, DATASET_SUBDIR)
+                if os.path.exists(candidate):
+                    data_dir = candidate
+                    found = True
+                    print(f'[DEAP] Found data at: {candidate}')
+                    break
+                # 或者子目录本身包含 .dat 文件
+                dat_in_sub = [f for f in sub_contents if f.endswith('.dat')]
+                if dat_in_sub:
+                    data_dir = sub
+                    found = True
+                    print(f'[DEAP] Found .dat files in: {sub}')
+                    break
+        if not found:
+            raise FileNotFoundError(
+                f'Expected {DATASET_SUBDIR} not found in {dataset_path}. '
+                f'Please check the dataset structure.')
 
     # 验证至少包含一个 .dat 文件
     dat_files = [f for f in os.listdir(data_dir) if f.endswith('.dat')]
