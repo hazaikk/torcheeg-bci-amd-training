@@ -1,16 +1,26 @@
 # ============================================
 # cloud_amd_training — Dependencies
-# Usage: pip install -r requirements.txt
+# Usage:
+#   pip install -r requirements.txt          # 标准安装
+#   bash run_training.sh                     # AMD Cloud 一键安装 + 训练
 # ============================================
 
 # Core ML
 torch>=2.0.0
 numpy>=1.24.0
-scipy>=1.10.0
+
+# scipy — Python 3.12 需 scipy>=1.12.0
+# torcheeg 官方要求 scipy>=1.7.3,<=1.10.1 但该约束与 Python 3.12 冲突。
+# 解决方法: 先装 scipy (不限版本), 再装 torcheeg 时加 --no-deps 跳过依赖检查。
+# 脚本 run_training.sh 已自动处理, 见注释.
+scipy>=1.12.0
 
 # TorchEEG (EEG 深度学习工具箱)
-# 如果 pip 安装失败, 可尝试:
-#   git+https://github.com/torcheeg/torcheeg.git
+# 注意: Python 3.12 下需加 --no-deps 安装 (因 scipy 版本约束冲突)
+#   pip install scipy --upgrade
+#   pip install torcheeg --no-deps
+# 或使用 run_training.sh 自动安装:
+#   bash run_training.sh
 torcheeg>=1.1.3
 
 # ML / Metrics
@@ -28,3 +38,9 @@ tqdm>=4.65.0
 
 # 可选: Jupyter notebook 集成
 ipykernel>=6.0.0
+
+# KaggleHub (DEAP 数据集下载)
+kagglehub>=0.3.0
+
+# 数据处理
+pandas>=2.0.0

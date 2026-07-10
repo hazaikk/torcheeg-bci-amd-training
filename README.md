@@ -283,6 +283,81 @@ python train.py --help
 | 训练速度 (16 GiB GPU) | ✅ 30 epoch × 3 models ≈ 20 min |
 | 内存使用 | ✅ < 8 GiB for batch_size=64 |
 
+## 🐍 Python 3.12 兼容: scipy 版本冲突
+
+AMD Cloud 默认 Python 3.12, 而 torcheeg 官方要求 `scipy<=1.10.1`。
+Python 3.12 需要 `scipy>=1.12.0`, 产生冲突。
+
+**解决方法:** 先装 scipy, 再装 torcheeg 时跳过依赖检查:
+
+```bash
+# ❌ 这样会失败:
+pip install torcheeg  # 因为 scipy 版本约束冲突
+
+# ✅ 正确方法:
+pip install scipy --upgrade          # 先装最新 scipy (>=1.12)
+pip install torcheeg --no-deps       # 跳过依赖检查
+pip install torchmetrics lmdb pytorch-lightning  # 手动装 torcheeg 的其他依赖
+
+# ✅ 或直接用脚本:
+bash run_training.sh deap           # run_training.sh 已自动处理 Python 3.12 兼容
+```
+
+`run_training.sh` 和 `requirements.txt` 均已内置 Python 3.12 兼容逻辑。
+
+---
+
+## 📥 DEAP 数据集下载慢的解决方案
+
+DEAP 数据集 ~1.4 GB (32 个 .dat 文件), 从 Kaggle 下载在 AMD Cloud 可能较慢。
+
+### 方案 A: 本地下载后上传 (推荐)
+
+```bash
+# 1. 在本地 (Windows/Mac) 下载
+#    方法 1: 使用 kagglehub
+pip install kagglehub
+python download_deap.py --data-dir ./deap_data
+
+#    方法 2: 从官方直接下载
+#    http://www.eecs.qmul.ac.uk/mmv/datasets/deap/data/data_preprocessed_python.zip
+#    解压得到 data_preprocessed_python/ 目录 (含 s01.dat ~ s32.dat)
+
+# 2. 在 AMD Cloud Jupyter 中上传
+#    - 打开 Jupyter File Browser
+#    - Upload → 选择 s01.dat ~ s32.dat
+#    - 或者打包上传: tar czf deap_data.tar.gz deap_data/
+#    - 然后在 Jupyter 中解压: tar xzf deap_data.tar.gz
+```
+
+### 方案 B: wget 直接从官方下载 (AMD Cloud 命令行)
+
+```bash
+# 在 AMD Cloud Terminal 中执行:
+cd /workspace/repo
+mkdir -p data/deap && cd data/deap
+
+# 官方 DEAP 数据集 (约 1.4 GB)
+wget -c http://www.eecs.qmul.ac.uk/mmv/datasets/deap/data/data_preprocessed_python.zip
+unzip data_preprocessed_python.zip
+mv data_preprocessed_python/*.dat ./
+rm -rf data_preprocessed_python data_preprocessed_python.zip
+cd ../..
+python preprocess_deap.py --models all --data-dir data/deap
+```
+
+### 方案 C: KaggleHub + 代理
+
+```bash
+# 设置国内代理 (如适用)
+export KAGGLEHUB_CACHE=/workspace/repo/kagglehub_cache
+python download_deap.py --data-dir data/deap
+```
+
+> **提示:** DEAP 只需下载一次, preprocess_deap.py 预处理后即可删除原始 .dat 文件。
+
+---
+
 ## 🔧 常见问题
 
 ### Q: pip install torcheeg 失败?
