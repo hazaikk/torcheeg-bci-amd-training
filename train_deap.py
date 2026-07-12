@@ -78,6 +78,7 @@ from config import (
 )
 from utils.model_utils import get_device, print_gpu_info
 from utils.training_strategies import EarlyStopping, create_scheduler
+from torcheeg.datasets import DEAPDataset
 
 # =====================================
 # 常量
@@ -568,8 +569,6 @@ def run_experiment(
             data = data.to(device)
     else:
         # ── 原生 DEAPDataset 模式 ──
-        from torcheeg.datasets import DEAPDataset
-
         online_transform = get_transform(model_name, chunk_size)
         label_transform = get_label_transform()
 
