@@ -642,14 +642,13 @@ def run_experiment(
                     train_dataset, val_dataset = tds, vds
                     break
 
+        # 数据已在 GPU (data.to(device)), 不需要 pin_memory
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
-            shuffle=True, num_workers=0, drop_last=False,
-            pin_memory=(device != 'cpu'))
+            shuffle=True, num_workers=0, drop_last=False)
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size,
-            shuffle=False, num_workers=0, drop_last=False,
-            pin_memory=(device != 'cpu'))
+            shuffle=False, num_workers=0, drop_last=False)
 
         if verbose:
             print(f'\n{"="*60}')
