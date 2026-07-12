@@ -564,9 +564,8 @@ def run_experiment(
                 assert val_subs & test_subject_ids == set(), f'Val-test overlap!'
             fold_indices.append((train_idx, val_idx))
 
-        # 清理内存
-        if device != 'cpu':
-            data = data.to(device)
+        # 数据留在 CPU, DataLoader 逐 batch 传到 GPU (见 train/evaluate 中的 .to(device))
+        # 这样显存占用从 ~11GB 降到 ~几百 MB
     else:
         # ── 原生 DEAPDataset 模式 ──
         online_transform = get_transform(model_name, chunk_size)
@@ -644,10 +643,12 @@ def run_experiment(
 
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
-            shuffle=True, num_workers=0, drop_last=False)
+            shuffle=True, num_workers=0, drop_last=False,
+            pin_memory=(device != 'cpu'))
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size,
-            shuffle=False, num_workers=0, drop_last=False)
+            shuffle=False, num_workers=0, drop_last=False,
+            pin_memory=(device != 'cpu'))
 
         if verbose:
             print(f'\n{"="*60}')
