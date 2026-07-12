@@ -530,7 +530,8 @@ def run_experiment(
                 print(f'       Hold-out test: {len(test_subject_ids)} subjects {sorted(test_subject_ids)}')
                 print(f'       Train/Val:     {len(train_val_subjects)} subjects')
         else:
-            train_val_subjects = sorted(subjects.unique().tolist())
+            unique_subjects = sorted(subjects.unique().tolist())
+            train_val_subjects = unique_subjects
 
         # 按 subject 的 KFold 分组
         if cv_strategy == 'leave_one_subject_out':
