@@ -56,6 +56,8 @@ scipy.signal.blackman = blackman
 from utils.fixes import apply_all_fixes
 apply_all_fixes()
 
+from utils.training_strategies import EarlyStopping
+
 from torcheeg.datasets import DEAPDataset
 from torcheeg import transforms as T
 from torcheeg.datasets.constants import DEAP_CHANNEL_LOCATION_DICT
@@ -235,6 +237,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=5,
                         help='训练轮数')
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--early-patience', type=int, default=15,
+                        help='早停容忍轮数 (默认 15, 0=不早停)')
     parser.add_argument('--gpu', action='store_true',
                         help='使用 GPU')
 
@@ -351,7 +355,11 @@ def main():
             model = ModelClass(**model_kwargs).to(device)
             criterion = nn.CrossEntropyLoss()
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+            early_stopping = EarlyStopping(
+                patience=args.early_patience, mode='max',
+                verbose=True) if args.early_patience > 0 else None
             best_val_acc = 0.0
+            best_model_state = None
 
             for epoch in range(args.epochs):
                 t_epoch = time.time()
@@ -362,12 +370,18 @@ def main():
 
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
+                    best_model_state = copy.deepcopy(model.state_dict())
 
                 if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == args.epochs - 1:
                     print(f'      Ep {epoch+1:3d}/{args.epochs} | '
                           f'T_loss:{train_loss:.4f} T_acc:{train_acc:.2f}% | '
                           f'V_loss:{val_loss:.4f} V_acc:{val_acc:.2f}% | '
                           f'{time.time()-t_epoch:.1f}s')
+
+                # 早停检查
+                if early_stopping and early_stopping(val_acc, epoch):
+                    print(f'      >>> Early stop @ epoch {epoch+1}')
+                    break
 
             fold_results.append(best_val_acc)
             print(f'      >>> Fold {fold_idx+1} best val acc: {best_val_acc:.2f}%')
@@ -413,6 +427,9 @@ def main():
         model = ModelClass(**model_kwargs).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        early_stopping = EarlyStopping(
+            patience=args.early_patience, mode='max',
+            verbose=True) if args.early_patience > 0 else None
         best_val_acc = 0.0
 
         for epoch in range(args.epochs):
@@ -429,6 +446,11 @@ def main():
                   f'T_loss:{train_loss:.4f} T_acc:{train_acc:.2f}% | '
                   f'V_loss:{val_loss:.4f} V_acc:{val_acc:.2f}% | '
                   f'{time.time()-t_epoch:.1f}s')
+
+            # 早停检查
+            if early_stopping and early_stopping(val_acc, epoch):
+                print(f'  >>> Early stop @ epoch {epoch+1}')
+                break
 
         print(f'\n  Best val acc: {best_val_acc:.2f}%')
 
