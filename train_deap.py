@@ -180,7 +180,8 @@ def load_preprocessed(model_name: str, data_dir: str,
 class CombinedDEAPDataset(Dataset):
     """加载预处理 .pt 文件的 Dataset
 
-    支持按 subject_ids 筛选, 用于交叉验证.
+    支持按 subject_ids 或 indices 筛选, 用于交叉验证.
+    核心优化: 传 indices 但不提前切片, 避免 GPU 显存翻倍.
     数据形态:
         EEGNet/TSCeption: (N, 1, 32, chunk_size)
         FBCNet/FBMSNet:   (N, 9, 32, chunk_size)
@@ -188,22 +189,27 @@ class CombinedDEAPDataset(Dataset):
     """
 
     def __init__(self, data, labels, subjects,
-                 subject_ids: Optional[List[int]] = None):
+                 subject_ids: Optional[List[int]] = None,
+                 indices: Optional[torch.Tensor] = None):
+        # 数据引用 (可能是 CPU 或 GPU tensor)
+        self._data = data
+        self._labels = labels.flatten()
+        self._subjects = subjects.flatten()
+
         if subject_ids is not None:
-            mask = torch.isin(subjects.flatten(), torch.tensor(subject_ids))
-            self.data = data[mask]
-            self.labels = labels[mask].flatten()
-            self.subjects = subjects[mask].flatten()
+            mask = torch.isin(self._subjects, torch.tensor(subject_ids))
+            self.indices = torch.where(mask)[0]
+        elif indices is not None:
+            self.indices = indices
         else:
-            self.data = data
-            self.labels = labels.flatten()
-            self.subjects = subjects.flatten()
+            self.indices = torch.arange(len(self._data))
 
     def __len__(self):
-        return len(self.data)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.data[idx], int(self.labels[idx]), int(self.subjects[idx])
+        real_idx = self.indices[idx]
+        return self._data[real_idx], int(self._labels[real_idx]), int(self._subjects[real_idx])
 
 
 # =====================================
@@ -630,10 +636,11 @@ def run_experiment(
     for fold_idx in range(min(n_folds, 2 if test_mode else n_folds)):
         if use_preprocessed:
             train_idx, test_idx = fold_indices[fold_idx]
+            # 传 indices 而非切片, 避免 GPU 显存翻倍
             train_dataset = CombinedDEAPDataset(
-                data[train_idx], labels[train_idx], subjects[train_idx])
+                data, labels, subjects, indices=train_idx)
             val_dataset = CombinedDEAPDataset(
-                data[test_idx], labels[test_idx], subjects[test_idx])
+                data, labels, subjects, indices=test_idx)
         else:
             # TorchEEG native: cv.split(dataset) yields (train_ds, val_ds)
             fold_gen = cv.split(dataset)
