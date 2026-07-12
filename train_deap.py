@@ -564,8 +564,9 @@ def run_experiment(
                 assert val_subs & test_subject_ids == set(), f'Val-test overlap!'
             fold_indices.append((train_idx, val_idx))
 
-        # 数据留在 CPU, DataLoader 逐 batch 传到 GPU (见 train/evaluate 中的 .to(device))
-        # 这样显存占用从 ~11GB 降到 ~几百 MB
+        # 数据移到 GPU 加速训练 (每个模型独立加载, 见外层循环)
+        if device != 'cpu':
+            data = data.to(device)
     else:
         # ── 原生 DEAPDataset 模式 ──
         online_transform = get_transform(model_name, chunk_size)
@@ -964,6 +965,9 @@ def main():
             verbose=verbose,
         )
         all_summaries.append(summary)
+        # Clear GPU cache between models
+        if device != "cpu":
+            torch.cuda.empty_cache()
 
     # ── Table 1 汇总 ──
     print(f'\n\n{"="*65}')
