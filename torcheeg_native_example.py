@@ -258,6 +258,13 @@ def main():
                         choices=['auto', 'de', 'bandpass', 'none'],
                         help='离线变换类型 (auto=各模型默认)')
 
+    # IO 性能参数
+    parser.add_argument('--io-mode', type=str, default='pickle',
+                        choices=['pickle', 'lmdb'],
+                        help='缓存模式 (pickle/lmdb, lmdb 更快)')
+    parser.add_argument('--num-worker', type=int, default=2,
+                        help='数据集加载 worker 数')
+
     # 标签处理
     parser.add_argument('--label', type=str, default='valence',
                         choices=['valence', 'arousal', 'dominance', 'liking'],
@@ -307,10 +314,10 @@ def main():
         offline_transform=offline_transform,
         online_transform=online_transform,
         label_transform=label_transform,
-        num_worker=2,
+        num_worker=args.num_worker,
         verbose=True,
         io_path=f'./_deap_cache_example_{args.model}_{args.chunk_size}_{args.offline}',
-        io_mode='pickle',
+        io_mode=args.io_mode,
     )
     print(f'  Dataset: {len(dataset)} samples ({time.time()-t0:.1f}s)')
 
