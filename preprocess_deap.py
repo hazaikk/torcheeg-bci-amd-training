@@ -492,6 +492,7 @@ def process_deap(data_dir: str,
         'num_channels': num_channel,
         'sampling_rate': DEAP_SAMPLING_RATE,
         'window_step': step,
+        'offline_type': offline_type,
     }
     meta_path = os.path.join(preproc_dir, 'meta.pt')
     torch.save(meta, meta_path)

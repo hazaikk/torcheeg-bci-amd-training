@@ -275,42 +275,87 @@ def get_criterion(model_name: str) -> nn.Module:
 
 
 def get_model(model_name: str, num_classes: int = 2,
-              chunk_size: int = 128) -> nn.Module:
-    """创建模型"""
+              chunk_size: int = 128,
+              offline_type: str = 'auto') -> nn.Module:
+    """创建模型, 支持不同 offline 预处理模式
+
+    Args:
+        model_name: 模型名
+        num_classes: 分类数
+        chunk_size: 窗口样本数 (仅对有时域维度的模式有效)
+        offline_type: 预处理类型, 影响模型参数 (in_channels 等)
+    """
     params_map = {'EEGNet': EEGNetParams, 'FBCNet': FBCNetParams,
                   'FBMSNet': FBMSNetParams, 'TSCeption': TSCeptionParams}
 
     if model_name == 'CCNN':
+        # CCNN: 4D输入 (N, t, 9, 9). in_channels = segment 数
+        if offline_type == 'de':
+            cnn_in_channels = 4  # DE 4 频带
+        else:
+            cnn_in_channels = chunk_size // 32  # 默认: 128/32=4
         return CCNNWrapper(
-            in_channels=chunk_size // 32, grid_size=(9, 9),
+            in_channels=cnn_in_channels, grid_size=(9, 9),
             num_classes=num_classes, dropout=0.5)
+
     elif model_name == 'EEGNet':
         from torcheeg.models import EEGNet
         p = params_map['EEGNet']()
+        if offline_type == 'de':
+            raise ValueError(
+                'EEGNet 不支持 DE 特征: 时间维度太小 (4) 小于卷积核大小 (64). '
+                '请使用 --offline bandpass 或 auto.')
+        # bandpass 模式: BandSignal → To2d 输出 (1, 9, 32, 128), EEGNet 用默认通道
         return EEGNet(chunk_size=chunk_size, num_electrodes=DEAP_NUM_CHANNELS,
                       F1=p.F1, F2=p.F2, D=p.D,
                       kernel_1=p.kernel_1, kernel_2=p.kernel_2,
                       dropout=p.dropout, num_classes=num_classes)
+
     elif model_name == 'TSCeption':
         from torcheeg.models import TSCeption
         p = params_map['TSCeption']()
+        if offline_type == 'de':
+            raise ValueError(
+                'TSCeption 不支持 DE 特征: 时间维度太小. '
+                '请使用 --offline bandpass 或 auto.')
         return TSCeption(num_electrodes=DEAP_NUM_CHANNELS, in_channels=1,
                          num_classes=num_classes, sampling_rate=DEAP_SAMPLING_RATE,
                          num_T=p.num_T, num_S=p.num_S,
                          hid_channels=p.hid_channels, dropout=p.dropout)
+
     elif model_name == 'FBCNet':
         from torcheeg.models import FBCNet
         p = params_map['FBCNet']()
+        if offline_type == 'de':
+            raise ValueError(
+                'FBCNet 不支持 DE 特征: 输出无频带维度且时间太小. '
+                '请使用 --offline bandpass 或 auto.')
+        if offline_type == 'none':
+            # 原始 EEG 作为单频带输入
+            return FBCNet(num_electrodes=DEAP_NUM_CHANNELS, chunk_size=chunk_size,
+                          in_channels=1, num_S=p.num_S, num_classes=num_classes,
+                          temporal=p.temporal, stride_factor=p.stride_factor)
         return FBCNet(num_electrodes=DEAP_NUM_CHANNELS, chunk_size=chunk_size,
                       in_channels=9, num_S=p.num_S, num_classes=num_classes,
                       temporal=p.temporal, stride_factor=p.stride_factor)
+
     elif model_name == 'FBMSNet':
         from torcheeg.models import FBMSNet
         p = params_map['FBMSNet']()
+        if offline_type == 'de':
+            raise ValueError(
+                'FBMSNet 不支持 DE 特征: 输出无频带维度且时间太小. '
+                '请使用 --offline bandpass 或 auto.')
+        if offline_type == 'none':
+            return FBMSNet(num_electrodes=DEAP_NUM_CHANNELS, chunk_size=chunk_size,
+                           in_channels=1, num_classes=num_classes,
+                           stride_factor=p.stride_factor, temporal=p.temporal,
+                           num_feature=p.num_feature, dilatability=p.dilatability)
         return FBMSNet(num_electrodes=DEAP_NUM_CHANNELS, chunk_size=chunk_size,
                        in_channels=9, num_classes=num_classes,
                        stride_factor=p.stride_factor, temporal=p.temporal,
                        num_feature=p.num_feature, dilatability=p.dilatability)
+
     else:
         raise ValueError(f'Unknown model: {model_name}')
 
@@ -508,10 +553,36 @@ def run_experiment(
                 return {'model': model_name, 'error': 'no_preprocessed_data'}
             return {'model': model_name, 'error': 'no_preprocessed_data'}
 
+        # 加载元数据获取 offline_type
+        meta_path = get_meta_path(preproc_dir)
+        if os.path.exists(meta_path):
+            meta = torch.load(meta_path, map_location='cpu', weights_only=True)
+            preproc_offline = meta.get('offline_type', 'auto')
+        else:
+            preproc_offline = 'auto'
+        if verbose:
+            print(f'       Offline:   {preproc_offline}')
+
+        # 模型兼容性检查 (DE 模式仅 CCNN 支持)
+        INCOMPATIBLE_OFFLINE = {
+            'EEGNet': ['de'], 'TSCeption': ['de'],
+            'FBCNet': ['de'], 'FBMSNet': ['de'],
+        }
+        if preproc_offline in INCOMPATIBLE_OFFLINE.get(model_name, []):
+            print(f'\n  [SKIP] {model_name} 与 offline_type={preproc_offline} 不兼容.')
+            print(f'         跳过该模型. 请使用 --offline bandpass 或 auto 重新预处理.')
+            return {'model': model_name,
+                    'error': f'incompatible_offline_{preproc_offline}'}
+
         # 加载数据
         data, labels, subjects = load_preprocessed(
             model_name, preproc_dir, device='cpu')
         n_total = len(data)
+
+        # 数据形状适配: 'none' 模式 FBCNet/FBMSNet 输出 3D (N,32,T), 需要 4D (N,1,32,T)
+        if preproc_offline == 'none' and model_name in ('FBCNet', 'FBMSNet'):
+            if data.dim() == 3:
+                data = data.unsqueeze(1)  # (N, 32, T) → (N, 1, 32, T)
 
         if verbose:
             cls_counts = Counter(labels.tolist())
@@ -666,7 +737,8 @@ def run_experiment(
 
         # 模型
         model = get_model(model_name, num_classes=DEAP_NUM_CLASSES,
-                          chunk_size=chunk_size)
+                          chunk_size=chunk_size,
+                          offline_type=preproc_offline if use_preprocessed else 'auto')
         model = model.to(device)
         criterion = get_criterion(model_name)
         optimizer = torch.optim.AdamW(
