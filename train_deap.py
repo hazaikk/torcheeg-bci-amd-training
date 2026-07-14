@@ -347,10 +347,9 @@ def get_model(model_name: str, num_classes: int = 2,
                 'FBMSNet 不支持 DE 特征: 输出无频带维度且时间太小. '
                 '请使用 --offline bandpass 或 auto.')
         if offline_type == 'none':
-            return FBMSNet(num_electrodes=DEAP_NUM_CHANNELS, chunk_size=chunk_size,
-                           in_channels=1, num_classes=num_classes,
-                           stride_factor=p.stride_factor, temporal=p.temporal,
-                           num_feature=p.num_feature, dilatability=p.dilatability)
+            raise ValueError(
+                'FBMSNet 不支持 none 模式: 模型内部 mixConv2d+BatchNorm '
+                '硬编码了多频带 (in_channels=9). 请使用 --offline bandpass 或 auto.')
         return FBMSNet(num_electrodes=DEAP_NUM_CHANNELS, chunk_size=chunk_size,
                        in_channels=9, num_classes=num_classes,
                        stride_factor=p.stride_factor, temporal=p.temporal,
@@ -563,10 +562,12 @@ def run_experiment(
         if verbose:
             print(f'       Offline:   {preproc_offline}')
 
-        # 模型兼容性检查 (DE 模式仅 CCNN 支持)
+        # 模型兼容性检查 (DE/none 模式只有部分模型支持)
         INCOMPATIBLE_OFFLINE = {
-            'EEGNet': ['de'], 'TSCeption': ['de'],
-            'FBCNet': ['de'], 'FBMSNet': ['de'],
+            'EEGNet': ['de'],
+            'TSCeption': ['de'],
+            'FBCNet': ['de'],
+            'FBMSNet': ['de', 'none'],  # FBMSNet 内部 mixConv 硬编码多频带, in_channels=1 不兼容
         }
         if preproc_offline in INCOMPATIBLE_OFFLINE.get(model_name, []):
             print(f'\n  [SKIP] {model_name} 与 offline_type={preproc_offline} 不兼容.')
