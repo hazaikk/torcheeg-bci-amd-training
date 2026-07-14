@@ -138,6 +138,102 @@ def get_transform(model_name: str, chunk_size: int = 128,
         raise ValueError(f'Unknown model: {model_name}')
 
 
+def _compute_de_batched(windows: np.ndarray,
+                         model_name: str,
+                         chunk_size: int,
+                         sampling_rate: int = 128,
+                         device: str = 'cpu') -> torch.Tensor:
+    """批量计算 Differential Entropy (比逐样本 BandDifferentialEntropy 快 ~100x)
+
+    用 scipy.signal.sosfilt 批处理所有窗口, 输出的 shape 与 TorchEEG 的
+    BandDifferentialEntropy + 模型特定后处理一致。
+
+    Args:
+        windows: numpy (n_windows, n_channels, chunk_size) — 已切窗数据
+        model_name: 模型名
+        chunk_size: 窗口样本数
+        sampling_rate: 采样率
+        device: 计算设备
+
+    Returns:
+        torch.float32 tensor
+         EEGNet: (n_windows, 1, 32, 4)
+         FBCNet: (n_windows, 32, 4)
+         CCNN:   (n_windows, 4, 9, 9)
+    """
+    # DE 频带 (与 TorchEEG BandDifferentialEntropy 默认一致)
+    de_bands = [('theta', 4, 8), ('alpha', 8, 14),
+                ('beta', 14, 31), ('gamma', 31, 49)]
+    n_bands = len(de_bands)
+    n_windows, n_channels, _ = windows.shape
+
+    print(f'[PREP] Computing DE for {n_windows} windows × {n_bands} bands '
+          f'({model_name})...', flush=True)
+
+    # ── 批处理: 对每个频带 bandpass 滤波后计算方差 → DE ──
+    #   sosfilt 支持 2D 输入 (n_signals, n_times), 因此可以对单个通道的
+    #   所有窗口一次性滤波 (n_windows, chunk_size) → 极大加速
+    de_features = np.zeros((n_windows, n_bands, n_channels), dtype=np.float32)
+
+    for bi, (band_name, low, high) in enumerate(de_bands):
+        t0 = time.time()
+        sos = butter(5, [low, high], btype='band',
+                     fs=sampling_rate, output='sos')
+
+        for ch in range(n_channels):
+            # 提取该通道的所有窗口 (n_windows, chunk_size), 一次 sosfilt 搞定
+            ch_data = np.ascontiguousarray(windows[:, ch, :])
+            filtered = sosfilt(sos, ch_data, axis=-1)
+            var = np.var(filtered, axis=-1)  # (n_windows,)
+            de_features[:, bi, ch] = 0.5 * np.log(
+                2 * np.pi * np.e * var + 1e-10)
+
+        elapsed = time.time() - t0
+        print(f'    DE {band_name} ({low}-{high}Hz): {elapsed:.1f}s', flush=True)
+
+    # ── 模型特定后处理 ──
+    t_fmt = time.time()
+
+    if model_name in ('EEGNet', 'TSCeption'):
+        # DE → To2d → ToTensor: (n_windows, n_bands, n_channels)
+        # TorchEEG 输出: (1, 32, 4) per sample → stack → (N, 1, 32, 4)
+        # 这里 de_features 是 (N, 4, 32), 需要 transpose 到 (N, 1, 32, 4)
+        result = np.transpose(de_features, (0, 2, 1))  # (N, 32, 4)
+        result = result[:, np.newaxis, :, :]            # (N, 1, 32, 4)
+        result = np.ascontiguousarray(result)
+
+    elif model_name in ('FBCNet', 'FBMSNet'):
+        # DE → ToTensor: (n_windows, n_bands, n_channels)
+        # TorchEEG 输出: (32, 4) per sample → stack → (N, 32, 4)
+        result = np.transpose(de_features, (0, 2, 1))  # (N, 32, 4)
+        result = np.ascontiguousarray(result)
+
+    elif model_name == 'CCNN':
+        # DE → ToGrid → ToTensor: TorchEEG 输出 (4, 9, 9) per sample
+        # de_features 是 (N, 4, 32), 对每个窗口: (4, 32) → transpose → (32, 4) → ToGrid → (4, 9, 9)
+        grid_rows, grid_cols = 9, 9
+        result = np.zeros((n_windows, n_bands, grid_rows, grid_cols),
+                          dtype=np.float32)
+        to_grid = T.ToGrid(DEAP_CHANNEL_LOCATION_DICT)
+        for i in range(n_windows):
+            # BandDifferentialEntropy 原始输出 shape: (n_channels, n_bands) = (32, 4)
+            de_2d = de_features[i].T  # (4, 32) → (32, 4)
+            grid_out = to_grid(eeg=de_2d)['eeg']  # (n_bands, 9, 9) = (4, 9, 9)
+            result[i] = grid_out
+
+    else:
+        raise ValueError(f'Unknown model: {model_name}')
+
+    result_tensor = torch.from_numpy(result).float()
+    elapsed = time.time() - t_fmt
+    print(f'[PREP] {model_name} DE formatting done ({elapsed:.1f}s), '
+          f'shape={tuple(result_tensor.shape)}', flush=True)
+
+    if device != 'cpu':
+        result_tensor = result_tensor.to(device)
+    return result_tensor
+
+
 def _bandpass_trials(trials_data: np.ndarray,
                      band_dict: Dict[str, List[int]],
                      sampling_rate: int = 128,
@@ -408,15 +504,21 @@ def process_deap(data_dir: str,
 
     for model_name in model_names:
         print()
-        transform = get_transform(model_name, chunk_size, offline_type)
-        # 快速路径: 仅 FBCNet/FBMSNet + bandpass 模式用 full_trials 先滤波再切窗
-        use_fast_path = (model_name in ('FBCNet', 'FBMSNet')
-                         and offline_type in ('auto', 'bandpass'))
-        transformed = precompute_transforms(
-            windows_f32, transform, model_name, chunk_size,
-            device=device,
-            full_trials=data_all if use_fast_path else None,
-            n_windows_per_trial=n_windows_per_trial)
+        if offline_type == 'de':
+            # DE 批处理快速路径 (比逐样本 TorchEEG DE 快 ~100x)
+            transformed = _compute_de_batched(
+                windows_f32, model_name, chunk_size,
+                device=device)
+        else:
+            transform = get_transform(model_name, chunk_size, offline_type)
+            # 快速路径: 仅 FBCNet/FBMSNet + bandpass 模式用 full_trials 先滤波再切窗
+            use_fast_path = (model_name in ('FBCNet', 'FBMSNet')
+                             and offline_type in ('auto', 'bandpass'))
+            transformed = precompute_transforms(
+                windows_f32, transform, model_name, chunk_size,
+                device=device,
+                full_trials=data_all if use_fast_path else None,
+                n_windows_per_trial=n_windows_per_trial)
 
         data_path = os.path.join(preproc_dir, f'{model_name}_data.pt')
         torch.save(transformed.contiguous(), data_path)
