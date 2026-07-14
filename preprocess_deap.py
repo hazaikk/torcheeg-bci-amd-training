@@ -6,10 +6,13 @@ DEAP 数据集预处理脚本
 用法:
     python preprocess_deap.py --models EEGNet TSCeption FBCNet FBMSNet CCNN
     python preprocess_deap.py --models EEGNet --chunk-size 256 --data-dir /path/to/deap
+    python preprocess_deap.py --models all --offline de
+    python preprocess_deap.py --models FBCNet --offline none
 
 输出:
     data/deap/preprocessed/EEGNet_data.pt     — (N, 1, 32, 128)  tensor
-    data/deap/preprocessed/FBCNet_data.pt     — (N, 9, 32, 128)  tensor
+    data/deap/preprocessed/FBCNet_data.pt     — (N, 9, 32, 128)  tensor (auto/bandpass)
+    data/deap/preprocessed/FBCNet_data.pt     — (N, n_bands, 32, 128)  tensor (de/none)
     data/deap/preprocessed/meta.pt            — 标签 + 元数据
 
 设计思路:
@@ -53,39 +56,84 @@ PREPROCESSED_DIR = 'preprocessed'
 AVAILABLE_MODELS = ['EEGNet', 'TSCeption', 'FBCNet', 'FBMSNet', 'CCNN']
 
 
-def get_transform(model_name: str, chunk_size: int = 128) -> callable:
+def get_transform(model_name: str, chunk_size: int = 128,
+                  offline_type: str = 'auto') -> callable:
     """获取模型对应的数据 transform
 
     Args:
         model_name: 模型名
         chunk_size: 时间窗口样本数
+        offline_type: 离线变换类型
+            'auto'     = 各模型默认 (CCNN→ToGrid, EEGNet→To2d, FBCNet→BandSignal)
+            'de'       = BandDifferentialEntropy
+            'bandpass' = BandSignal (9 频带)
+            'none'     = 无频带分解, 仅基础格式转换
 
     Returns:
         transform: 接收 (eeg: np.ndarray of (32, chunk_size)) 返回 tensor
     """
+    fbc_bands = {
+        f'band{i}': [4 * i, 4 * (i + 1)]
+        for i in range(1, 10)
+    }
+
     if model_name == 'CCNN':
-        # CCNN: (32, chunk_size) → ToGrid → (chunk_size, 9, 9)
-        return T.Compose([
-            T.ToGrid(DEAP_CHANNEL_LOCATION_DICT),
-            T.ToTensor(),
-        ])
+        # CCNN: (32, chunk_size) → (chunk_size, 9, 9)
+        if offline_type == 'de':
+            return T.Compose([
+                T.BandDifferentialEntropy(),
+                T.ToGrid(DEAP_CHANNEL_LOCATION_DICT),
+                T.ToTensor(),
+            ])
+        elif offline_type == 'bandpass':
+            return T.Compose([
+                T.BandSignal(sampling_rate=DEAP_SAMPLING_RATE, band_dict=fbc_bands),
+                T.ToGrid(DEAP_CHANNEL_LOCATION_DICT),
+                T.ToTensor(),
+            ])
+        else:  # 'auto' or 'none'
+            return T.Compose([
+                T.ToGrid(DEAP_CHANNEL_LOCATION_DICT),
+                T.ToTensor(),
+            ])
+
     elif model_name in ('EEGNet', 'TSCeption'):
-        # (32, chunk_size) → To2d → (1, 32, chunk_size)
-        return T.Compose([
-            T.To2d(),
-            T.ToTensor(),
-        ])
+        # (32, chunk_size) → (1, 32, chunk_size)
+        if offline_type == 'de':
+            return T.Compose([
+                T.BandDifferentialEntropy(),
+                T.To2d(),
+                T.ToTensor(),
+            ])
+        elif offline_type == 'bandpass':
+            return T.Compose([
+                T.BandSignal(sampling_rate=DEAP_SAMPLING_RATE, band_dict=fbc_bands),
+                T.To2d(),
+                T.ToTensor(),
+            ])
+        else:  # 'auto' or 'none'
+            return T.Compose([
+                T.To2d(),
+                T.ToTensor(),
+            ])
+
     elif model_name in ('FBCNet', 'FBMSNet'):
-        # 9-band FFT → (9, 32, chunk_size)
-        fbc_bands = {
-            f'band{i}': [4 * i, 4 * (i + 1)]
-            for i in range(1, 10)
-        }
-        return T.Compose([
-            T.BandSignal(sampling_rate=DEAP_SAMPLING_RATE,
-                         band_dict=fbc_bands),
-            T.ToTensor(),
-        ])
+        # (32, chunk_size) → (n_bands, 32, chunk_size)
+        if offline_type in ('auto', 'bandpass'):
+            return T.Compose([
+                T.BandSignal(sampling_rate=DEAP_SAMPLING_RATE, band_dict=fbc_bands),
+                T.ToTensor(),
+            ])
+        elif offline_type == 'de':
+            return T.Compose([
+                T.BandDifferentialEntropy(),
+                T.ToTensor(),
+            ])
+        else:  # 'none'
+            # 无频带分解: 加回通道维度作为伪频带
+            return T.Compose([
+                T.ToTensor(),
+            ])
     else:
         raise ValueError(f'Unknown model: {model_name}')
 
@@ -230,7 +278,8 @@ def process_deap(data_dir: str,
                  num_channel: int = 32,
                  output_dir: str = '',
                  num_subjects: Optional[int] = None,
-                 device: str = 'cpu') -> Dict[str, str]:
+                 device: str = 'cpu',
+                 offline_type: str = 'auto') -> Dict[str, str]:
     """主处理函数
 
     加载原始 DEAP .dat 文件 → 分割窗口 → 应用 transforms → 保存 .pt
@@ -359,11 +408,14 @@ def process_deap(data_dir: str,
 
     for model_name in model_names:
         print()
-        transform = get_transform(model_name, chunk_size)
+        transform = get_transform(model_name, chunk_size, offline_type)
+        # 快速路径: 仅 FBCNet/FBMSNet + bandpass 模式用 full_trials 先滤波再切窗
+        use_fast_path = (model_name in ('FBCNet', 'FBMSNet')
+                         and offline_type in ('auto', 'bandpass'))
         transformed = precompute_transforms(
             windows_f32, transform, model_name, chunk_size,
             device=device,
-            full_trials=data_all if model_name in ('FBCNet', 'FBMSNet') else None,
+            full_trials=data_all if use_fast_path else None,
             n_windows_per_trial=n_windows_per_trial)
 
         data_path = os.path.join(preproc_dir, f'{model_name}_data.pt')
@@ -401,6 +453,10 @@ def main():
                         help='处理的受试者数 (默认全部 32)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出目录')
+    parser.add_argument('--offline', type=str, default='auto',
+                        choices=['auto', 'de', 'bandpass', 'none'],
+                        help='离线变换类型 (auto=各模型默认, de=微分熵, '
+                             'bandpass=9频带滤波, none=仅格式转换)')
     parser.add_argument('--gpu', action='store_true',
                         help='使用 GPU 加速预计算')
     args = parser.parse_args()
@@ -425,6 +481,8 @@ def main():
     if device == 'cuda':
         print(f'[PREP] Using GPU: {torch.cuda.get_device_name(0)}')
 
+    print(f'[PREP] Offline transform: {args.offline}')
+
     process_deap(
         data_dir=data_dir,
         model_names=models,
@@ -433,6 +491,7 @@ def main():
         output_dir=args.output_dir,
         num_subjects=args.num_subjects,
         device=device,
+        offline_type=args.offline,
     )
 
 
