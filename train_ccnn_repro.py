@@ -254,7 +254,6 @@ def run_ccnn_experiment(
         n_total = len(dataset)
         if verbose:
             print(f'\n[DEAP] CCNN-DE Dataset: {n_total} samples')
-            # 采样统计类别分布
             sample_labels = []
             for i in range(min(1000, n_total)):
                 s = dataset[i]
@@ -263,33 +262,81 @@ def run_ccnn_experiment(
             cls_counts = Counter(sample_labels)
             print(f'       Class distribution (sample): {dict(cls_counts)}')
 
-        # 交叉验证策略
-        from torcheeg.model_selection import (
-            KFoldGroupbyTrial, KFold, LeaveOneSubjectOut,
-        )
-        split_dir = os.path.join(run_dir, f'_deap_split_ccnn_de_{chunk_size}')
-        if cv_strategy == 'leave_one_subject_out':
-            cv = LeaveOneSubjectOut(split_path=f'{split_dir}_loso')
-        elif cv_strategy == 'kfold':
-            cv = KFold(n_splits=n_splits, shuffle=True, random_state=42,
-                       split_path=f'{split_dir}_k{n_splits}')
-        elif cv_strategy == 'kfold_groupby_trial':
-            cv = KFoldGroupbyTrial(n_splits=n_splits, shuffle=True, random_state=42,
-                                   split_path=f'{split_dir}_kgt{n_splits}')
-        else:
-            raise ValueError(f'Unknown CV: {cv_strategy}')
+        # ── 将 LMDB 数据批量读入 tensor (避免 cv.split 复制 LMDB 崩溃) ──
+        print(f'  Loading all data into memory...', flush=True)
+        all_data, all_labels, all_subjects = [], [], []
+        batch_gen = DataLoader(dataset, batch_size=1024, shuffle=False,
+                               num_workers=0)
+        for batch in batch_gen:
+            if isinstance(batch, dict):
+                all_data.append(batch['eeg'])
+                all_labels.append(batch['y'].flatten())
+            elif isinstance(batch, (list, tuple)):
+                all_data.append(batch[0])
+                all_labels.append(batch[1].flatten())
+        data = torch.cat(all_data, dim=0)
+        labels = torch.cat(all_labels, dim=0)
 
-        # 生成 fold 迭代器
+        # subject_ids: DEAPDataset 按 trial/受试者顺序排列
+        # BaselineRemoval → 60s/trial, 1s窗口 → 60 windows/trial
+        # DEAP = 32 subjects × 40 trials × 60 windows = 76800
+        n_windows_per_trial = n_total // (32 * 40)  # 应=60
+        n_subjects = 32
+        n_trials_per_subject = 40
+        subjects = torch.zeros(n_total, dtype=torch.long)
+        for si in range(n_subjects):
+            start = si * n_trials_per_subject * n_windows_per_trial
+            end = (si + 1) * n_trials_per_subject * n_windows_per_trial
+            subjects[start:end] = si + 1
+
+        if verbose:
+            print(f'       Data shape: {tuple(data.shape)}, '
+                  f'Labels: {Counter(labels.tolist())}')
+
+        # 数据移到 GPU
+        if device != 'cpu':
+            data = data.to(device)
+
+        # ── 按 subject 手动 KFold (与 deap_multi_model 一致) ──
+        unique_subjects = sorted(subjects.unique().tolist())
+        np.random.seed(42)
+        np.random.shuffle(unique_subjects)
+        fold_subject_groups = np.array_split(
+            unique_subjects, min(n_splits, len(unique_subjects)))
+        fold_subject_groups = [g.tolist() if hasattr(g, 'tolist') else list(g)
+                               for g in fold_subject_groups]
+
         fold_indices_list = []
-        for train_ds, val_ds in cv.split(dataset):
-            fold_indices_list.append((train_ds, val_ds))
+        for val_subjects in fold_subject_groups:
+            train_mask = ~torch.isin(subjects, torch.tensor(val_subjects))
+            val_mask = torch.isin(subjects, torch.tensor(val_subjects))
+            train_idx = torch.where(train_mask)[0]
+            val_idx = torch.where(val_mask)[0]
+            fold_indices_list.append((train_idx, val_idx))
 
         n_folds = len(fold_indices_list)
         if test_mode:
             n_folds = min(n_folds, 2)
 
+        # 关闭 dataset 释放 LMDB 连接
+        del dataset, batch_gen, all_data, all_labels, all_subjects
+
     else:
         raise ValueError(f'Unknown mode: {mode}. Use "native" (recommended).')
+
+    # ── 数据集包装器 (用于手动索引切分) ──
+    class CCNNDataset(Dataset):
+        def __init__(self, data, labels, indices=None):
+            self._data = data
+            self._labels = labels.flatten()
+            self.indices = indices if indices is not None else torch.arange(len(data))
+
+        def __len__(self):
+            return len(self.indices)
+
+        def __getitem__(self, idx):
+            real_idx = self.indices[idx]
+            return self._data[real_idx], int(self._labels[real_idx])
 
     # ── 逐折训练 ──
     actual_epochs = 1 if test_mode else epochs
@@ -300,7 +347,16 @@ def run_ccnn_experiment(
     best_model_state = None
 
     for fold_idx in range(n_folds):
-        train_dataset, val_dataset = fold_indices_list[fold_idx]
+        fold_item = fold_indices_list[fold_idx]
+
+        if mode == 'native':
+            # 从 tensor + 索引构建 DataLoader
+            train_idx, val_idx = fold_item
+            train_dataset = CCNNDataset(data, labels, indices=train_idx)
+            val_dataset = CCNNDataset(data, labels, indices=val_idx)
+        else:
+            # 从 DEAPDataset subset 构建 (预留)
+            train_dataset, val_dataset = fold_item
 
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
