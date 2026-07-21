@@ -140,6 +140,7 @@ def get_transform(model_name: str) -> callable:
     elif model_name == 'SSTEmotionNet':
         return T.Compose([
             T.ToInterpolatedGrid(DEAP_CHANNEL_LOCATION_DICT),
+            T.ToTensor(),
             T.Resize(size=(16, 16)),
         ])
 
