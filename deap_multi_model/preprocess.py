@@ -311,14 +311,14 @@ def precompute_model_data(windows: np.ndarray,
                                 axis=-1).astype(np.float32)
         print(f'  Concatenated: {tuple(concat.shape)}', flush=True)
 
-        # ── 4. ToInterpolatedGrid + Resize per sample ──
-        #    输入 per sample: (32, 36) → 输出 (36, 16, 16)
+        # ── 4. ToInterpolatedGrid + ToTensor + Resize per sample ──
+        #    输入 per sample: (32, 36) → 输出 (36, 16, 16) torch tensor
         sst_transform = get_transform('SSTEmotionNet')
         result_list = []
         log_int = max(1, n_total // 20)
         for i in range(n_total):
-            out = sst_transform(eeg=concat[i])['eeg']  # (36, 16, 16)
-            result_list.append(torch.from_numpy(out).float())
+            out = sst_transform(eeg=concat[i])['eeg']  # torch (36, 16, 16)
+            result_list.append(out.float())
             if (i + 1) % log_int == 0 or i == n_total - 1:
                 pct = (i + 1) / n_total * 100
                 elapsed = time.time() - t0
