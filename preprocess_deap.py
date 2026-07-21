@@ -375,7 +375,8 @@ def process_deap(data_dir: str,
                  output_dir: str = '',
                  num_subjects: Optional[int] = None,
                  device: str = 'cpu',
-                 offline_type: str = 'auto') -> Dict[str, str]:
+                 offline_type: str = 'auto',
+                 label_mode: str = 'global') -> Dict[str, str]:
     """主处理函数
 
     加载原始 DEAP .dat 文件 → 分割窗口 → 应用 transforms → 保存 .pt
@@ -477,8 +478,26 @@ def process_deap(data_dir: str,
 
     print(f'[PREP] Total windows: {n_total_windows}')
 
-    # ── 标签二值化: valence > 5 → 1 (high), else → 0 (low) ──
-    labels_binary = (expanded_labels_v > 5.0).astype(np.int64)
+    # ── 标签二值化 ──
+    if label_mode == 'subject':
+        # Per-subject median split: 每受试者自己的 valence 中位数
+        labels_binary = np.zeros(n_total_windows, dtype=np.int64)
+        unique_subs = np.unique(expanded_subjects)
+        for sub_id in unique_subs:
+            sub_mask = expanded_subjects == sub_id
+            sub_labels = expanded_labels_v[sub_mask]
+            median_val = np.median(sub_labels)
+            labels_binary[sub_mask] = (expanded_labels_v[sub_mask] > median_val).astype(np.int64)
+        print(f'[PREP] Label mode: subject (per-subject median split)')
+    else:
+        # Global threshold: valence > 5.0 → 1 (high), else → 0 (low)
+        labels_binary = (expanded_labels_v > 5.0).astype(np.int64)
+        print(f'[PREP] Label mode: global (valence > 5.0 → high)')
+
+    cls0 = (labels_binary == 0).sum()
+    cls1 = (labels_binary == 1).sum()
+    print(f'[PREP] Class distribution: 0={cls0} ({cls0/n_total_windows*100:.1f}%), '
+          f'1={cls1} ({cls1/n_total_windows*100:.1f}%)')
 
     # ── 保存元数据 ──
     meta = {
@@ -493,6 +512,7 @@ def process_deap(data_dir: str,
         'sampling_rate': DEAP_SAMPLING_RATE,
         'window_step': step,
         'offline_type': offline_type,
+        'label_mode': label_mode,
     }
     meta_path = os.path.join(preproc_dir, 'meta.pt')
     torch.save(meta, meta_path)
@@ -560,6 +580,9 @@ def main():
                         choices=['auto', 'de', 'bandpass', 'none'],
                         help='离线变换类型 (auto=各模型默认, de=微分熵, '
                              'bandpass=9频带滤波, none=仅格式转换)')
+    parser.add_argument('--label-mode', type=str, default='global',
+                        choices=['global', 'subject'],
+                        help='标签策略: global (>5.0) 或 subject (per-subject median split)')
     parser.add_argument('--gpu', action='store_true',
                         help='使用 GPU 加速预计算')
     args = parser.parse_args()
@@ -595,6 +618,7 @@ def main():
         num_subjects=args.num_subjects,
         device=device,
         offline_type=args.offline,
+        label_mode=args.label_mode,
     )
 
 

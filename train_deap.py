@@ -522,6 +522,7 @@ def run_experiment(
     test_mode: bool = False,
     test_ratio: float = 0.0,
     verbose: bool = True,
+    label_mode: str = 'global',
 ) -> Dict:
     """运行 DEAP 实验
 
@@ -552,15 +553,22 @@ def run_experiment(
                 return {'model': model_name, 'error': 'no_preprocessed_data'}
             return {'model': model_name, 'error': 'no_preprocessed_data'}
 
-        # 加载元数据获取 offline_type
+        # 加载元数据获取 offline_type + label_mode
         meta_path = get_meta_path(preproc_dir)
         if os.path.exists(meta_path):
             meta = torch.load(meta_path, map_location='cpu', weights_only=True)
             preproc_offline = meta.get('offline_type', 'auto')
+            # 从 meta 读取 label_mode, 未指定则用参数 (或默认 global)
+            meta_label_mode = meta.get('label_mode', label_mode)
+            if label_mode and label_mode != meta_label_mode:
+                print(f'  [WARN] --label-mode={label_mode} != meta label_mode={meta_label_mode}')
+                print(f'         Using meta label_mode={meta_label_mode}')
+            label_mode = meta_label_mode
         else:
             preproc_offline = 'auto'
         if verbose:
             print(f'       Offline:   {preproc_offline}')
+            print(f'       LabelMode: {label_mode}')
 
         # 模型兼容性检查 (DE/none 模式只有部分模型支持)
         INCOMPATIBLE_OFFLINE = {
@@ -871,6 +879,7 @@ def run_experiment(
         'use_preprocessed': use_preprocessed,
         'test_mode': test_mode,
         'test_ratio': test_ratio,
+        'label_mode': label_mode,
         'fold_results': fold_results,
         'mean_val_acc': round(float(np.mean(val_accs)), 2),
         'std_val_acc': round(float(np.std(val_accs)), 2),
@@ -947,6 +956,10 @@ def parse_args():
                     help='快速测试模式 (1 epoch, 2 folds)')
     p.add_argument('--test-ratio', type=float, default=0.0,
                     help='held-out test set 比例 (如 0.2=20% subjects 做最终测试)')
+    p.add_argument('--label-mode', type=str, default=None,
+                    choices=['global', 'subject', None],
+                    help='标签策略: global (>5.0) 或 subject (per-subject median). '
+                         '预处理模式自动从 meta 读取.')
     p.add_argument('--quiet', action='store_true')
     return p.parse_args()
 
@@ -1010,9 +1023,11 @@ def main():
     window_label = f'{args.chunk_size}pt_{args.chunk_size/DEAP_SAMPLING_RATE:.0f}s'
     mode_label = 'pre' if args.use_preprocessed else 'native'
     test_label = '_TEST' if args.test else ''
+    lm = args.label_mode or 'global'
+    label_label = f'_{lm}'
     results_dir = os.path.join(
         args.results_dir,
-        f'DEAP_{window_label}_{args.cv}_{mode_label}{test_label}_{timestamp}')
+        f'DEAP_{window_label}_{args.cv}_{mode_label}{label_label}{test_label}_{timestamp}')
     os.makedirs(results_dir, exist_ok=True)
 
     with open(os.path.join(results_dir, 'config.json'), 'w') as f:
@@ -1029,6 +1044,9 @@ def main():
         model_dir = os.path.join(results_dir, model_name)
         os.makedirs(model_dir, exist_ok=True)
 
+        # 确定 label_mode: 预处理模式自动从 meta 读, 否则用参数
+        label_mode = args.label_mode if args.label_mode else 'global'
+
         summary = run_experiment(
             model_name=model_name, deap_root=deap_root,
             chunk_size=args.chunk_size,
@@ -1043,6 +1061,7 @@ def main():
             test_mode=args.test,
             test_ratio=args.test_ratio,
             verbose=verbose,
+            label_mode=label_mode,
         )
         all_summaries.append(summary)
         # Clear GPU cache between models
