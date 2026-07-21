@@ -36,6 +36,34 @@ from utils import EarlyStopping, create_scheduler, set_seed
 
 
 # =====================================
+# MTCNN Wrapper — 修复 BatchNorm1d(1) bug
+# =====================================
+
+class MTCNNWrapper(nn.Module):
+    """修复 MTCNN 的 BatchNorm1d(1) 与 2D 输出不兼容的问题
+
+    torcheeg 的 MTCNN.forward 中:
+      x = self.lin1(x)                    # (batch, 512)
+      x = x.transpose(-1, -2)             # (512, batch)
+      x = self.lin1_bn(x)                 # BatchNorm1d(1) ❌
+    BatchNorm1d(1) 期望最后一维=1, 但 transpose 后为 batch_size.
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        # 用 Identity 替换有问题的 BatchNorm1d(1)
+        self.model.lin1_bn = nn.Identity()
+
+    def forward(self, x):
+        out = self.model(x)
+        # MTCNN 返回 (valence_logits, arousal_logits)
+        # 训练时取 valence 输出
+        if isinstance(out, (tuple, list)):
+            return out[0]
+        return out
+
+
+# =====================================
 # Dataset
 # =====================================
 
@@ -111,7 +139,7 @@ def create_model(model_name: str, num_classes: int = 2) -> nn.Module:
 
     elif model_name == 'MTCNN':
         from torcheeg.models import MTCNN
-        return MTCNN(**params)
+        return MTCNNWrapper(MTCNN(**params))
 
     elif model_name == 'SSTEmotionNet':
         from torcheeg.models import SSTEmotionNet
@@ -161,10 +189,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
         optimizer.zero_grad()
         outputs = model(inputs)
 
-        # MTCNN 返回 (valence_logits, arousal_logits) 元组
-        if isinstance(outputs, (tuple, list)):
-            outputs = outputs[0]  # 取 valence 输出
-
+        # MTCNNWrapper 已自动提取 valence 输出
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -194,10 +219,7 @@ def evaluate(model, dataloader, criterion, device):
             labels = labels.to(device).long()
             outputs = model(inputs)
 
-            # MTCNN 返回 (valence_logits, arousal_logits) 元组
-            if isinstance(outputs, (tuple, list)):
-                outputs = outputs[0]  # 取 valence 输出
-
+            # MTCNNWrapper 已自动提取 valence 输出
             loss = criterion(outputs, labels)
 
             running_loss += loss.item()
