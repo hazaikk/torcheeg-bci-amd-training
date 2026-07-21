@@ -173,22 +173,43 @@ run_deap_multi_model() {
 
     cd deap_multi_model
 
-    # 预处理所有模型
-    echo "  Preprocessing all models (including MTCNN, SSTEmotionNet, TSLANet)..."
+    # 预处理所有模型 (global 模式, 与原实验一致)
+    echo "  Preprocessing all models (global threshold 5.0)..."
     python preprocess.py \
         --models Conformer VanillaTransformer LSTM GRU DGCNN LGGNet STNet LMDA CSPNet MTCNN SSTEmotionNet TSLANet \
         --chunk-size 128 \
+        --label-mode global \
         --data-dir ../data/deap \
         --output-dir ../data/deap_preprocessed_mm \
         --gpu
 
-    # 训练所有模型
-    echo "  Training all models..."
+    # 训练所有模型 (global)
+    echo "  Training all models (global)..."
     python train.py \
         --models Conformer VanillaTransformer LSTM GRU DGCNN LGGNet STNet LMDA CSPNet MTCNN SSTEmotionNet TSLANet \
         --chunk-size 128 \
         --cv kfold_groupby_trial \
         --preproc-dir ../data/deap_preprocessed_mm \
+        --gpu \
+        --epochs 200
+
+    # 预处理 (subject 模式, per-subject median split)
+    echo "  Preprocessing all models (subject median split)..."
+    python preprocess.py \
+        --models Conformer VanillaTransformer LSTM GRU DGCNN LGGNet STNet LMDA CSPNet MTCNN SSTEmotionNet TSLANet \
+        --chunk-size 128 \
+        --label-mode subject \
+        --data-dir ../data/deap \
+        --output-dir ../data/deap_preprocessed_mm_subject \
+        --gpu
+
+    # 训练所有模型 (subject)
+    echo "  Training all models (subject median split)..."
+    python train.py \
+        --models Conformer VanillaTransformer LSTM GRU DGCNN LGGNet STNet LMDA CSPNet MTCNN SSTEmotionNet TSLANet \
+        --chunk-size 128 \
+        --cv kfold_groupby_trial \
+        --preproc-dir ../data/deap_preprocessed_mm_subject \
         --gpu \
         --epochs 200
 
@@ -207,9 +228,14 @@ run_ccnn_repro() {
     fi
 
     # 使用 TorchEEG 原生 DEAPDataset (自动 DE 预处理)
-    echo "  Training CCNN with DE features (target: 92.23%)..."
+    # 注意: 需要先删除旧缓存 rm -rf nm_results/_deap_cache
+    # 因为 label_transform 已从 Binary(5.0) 改为 Select('valence')
+
+    # 模式 A: subject (per-subject median split, 每类 ~50%, 推荐)
+    echo "  Training CCNN with DE features (subject median split)..."
     python train_ccnn_repro.py \
         --mode native \
+        --label-mode subject \
         --cv kfold_groupby_trial \
         --chunk-size 128 \
         --batch-size 128 \
@@ -218,10 +244,24 @@ run_ccnn_repro() {
         --early-patience 15 \
         --gpu
 
-    # 也尝试 LOSO 模式 (与 TorchEEG EMO 论文更一致的评估方式)
-    echo "  Training CCNN with DE features (LOSO, target: 92.23%)..."
+    # 模式 B: global (与原 TorchEEG EMO 一致的 valence > 5.0)
+    echo "  Training CCNN with DE features (global threshold 5.0)..."
     python train_ccnn_repro.py \
         --mode native \
+        --label-mode global \
+        --cv kfold_groupby_trial \
+        --chunk-size 128 \
+        --batch-size 128 \
+        --lr 0.001 \
+        --epochs 200 \
+        --early-patience 15 \
+        --gpu
+
+    # 也尝试 LOSO 模式 (跨受试者泛化)
+    echo "  Training CCNN with DE features (LOSO, subject median)..."
+    python train_ccnn_repro.py \
+        --mode native \
+        --label-mode subject \
         --cv leave_one_subject_out \
         --chunk-size 128 \
         --batch-size 128 \

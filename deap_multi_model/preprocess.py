@@ -381,7 +381,8 @@ def process_all(data_dir: str,
                 overlap: int = 0,
                 output_dir: str = '',
                 num_subjects: Optional[int] = None,
-                device: str = 'cpu') -> Dict[str, str]:
+                device: str = 'cpu',
+                label_mode: str = 'global') -> Dict[str, str]:
     """主处理函数: 加载 DEAP .dat → 分割窗口 → transforms → 保存 .pt"""
     if output_dir:
         preproc_dir = output_dir
@@ -447,8 +448,22 @@ def process_all(data_dir: str,
             expanded_trials[idx] = trial_ids[ti]
             idx += 1
 
-    # ── 二值化标签 ──
-    labels_binary = (expanded_labels_v > 5.0).astype(np.int64)
+    # ── 二值化标签 (支持全局阈值和受试者中位数法) ──
+    if label_mode == 'subject':
+        # Per-subject median split: 平衡每类约 50%
+        labels_binary = np.zeros(n_total_windows, dtype=np.int64)
+        unique_subs = np.unique(expanded_subjects)
+        for sub_id in unique_subs:
+            sub_mask = expanded_subjects == sub_id
+            sub_labels = expanded_labels_v[sub_mask]
+            median_val = np.median(sub_labels)
+            labels_binary[sub_mask] = (expanded_labels_v[sub_mask] > median_val).astype(np.int64)
+        print(f'[PREP] Label mode: subject (per-subject median split)')
+    else:
+        # Global threshold 5.0 (TorchEEG EMO 默认, 但导致 ~79% 多数类)
+        labels_binary = (expanded_labels_v > 5.0).astype(np.int64)
+        print(f'[PREP] Label mode: global (valence > 5.0 → high)')
+
     print(f'[PREP] Total: {n_total_windows} windows')
     cls0 = (labels_binary == 0).sum()
     cls1 = (labels_binary == 1).sum()
@@ -466,6 +481,7 @@ def process_all(data_dir: str,
         'num_channels': DEAP_NUM_CHANNELS,
         'sampling_rate': DEAP_SAMPLING_RATE,
         'window_step': step,
+        'label_mode': label_mode,
     }
     meta_path = os.path.join(preproc_dir, 'meta.pt')
     torch.save(meta, meta_path)
@@ -512,6 +528,9 @@ def main():
     parser.add_argument('--overlap', type=int, default=0)
     parser.add_argument('--num-subjects', type=int, default=None)
     parser.add_argument('--output-dir', type=str, default=None)
+    parser.add_argument('--label-mode', type=str, default='global',
+                        choices=['global', 'subject'],
+                        help='标签策略: global(>5.0) 或 subject(per-subject median split)')
     parser.add_argument('--gpu', action='store_true')
     args = parser.parse_args()
 
@@ -536,6 +555,7 @@ def main():
         output_dir=args.output_dir,
         num_subjects=args.num_subjects,
         device=device,
+        label_mode=args.label_mode,
     )
 
 

@@ -108,29 +108,31 @@ def create_ccnn() -> nn.Module:
 # DEAPDataset — CCNN 专用 transforms
 # ══════════════════════════════════════════════════
 
-def get_ccnn_transforms():
+def get_ccnn_transforms(label_mode: str = 'global'):
     """获取 CCNN 复现所需的 DE + ToGrid transforms
 
     与 TorchEEG EMO paper 完全一致:
       offline: BandDifferentialEntropy → ToGrid(9×9)
       online:  ToTensor
-      label:   Select('valence') → Binary(5.0)
+      label:   Select('valence') (连续值 1-9, binarize 在内存中完成)
+
+    Args:
+        label_mode: 'global' → threshold 5.0; 'subject' → per-subject median split
     """
     offline_transform = T.Compose([
         T.BandDifferentialEntropy(sampling_rate=DEAP_SAMPLING_RATE),
         T.ToGrid(DEAP_CHANNEL_LOCATION_DICT),
     ])
     online_transform = T.ToTensor()
-    label_transform = T.Compose([
-        T.Select('valence'),
-        T.Binary(5.0),
-    ])
+    # 存储连续 valence 值, binarize 在内存中完成
+    label_transform = T.Select('valence')
     return offline_transform, online_transform, label_transform
 
 
-def get_deap_dataset(cache_dir: str, chunk_size: int = 128):
+def get_deap_dataset(cache_dir: str, chunk_size: int = 128,
+                     label_mode: str = 'global'):
     """创建 CCNN 专用 DEAPDataset, 使用固定缓存路径复用 LMDB"""
-    offline, online, label = get_ccnn_transforms()
+    offline, online, label = get_ccnn_transforms(label_mode)
     os.makedirs(cache_dir, exist_ok=True)
     return DEAPDataset(
         root_path=DEFAULT_DEAP_DIR,
@@ -240,30 +242,28 @@ def run_ccnn_experiment(
     run_dir: str = '',
     test_mode: bool = False,
     verbose: bool = True,
+    label_mode: str = 'global',
 ) -> Dict:
     """CCNN 复现实验
 
     使用 DE 特征 + ToGrid 预处理, 目标复现 92.23% 准确率.
+
+    Args:
+        label_mode: 'global' → valence > 5.0 二分类 (TorchEEG EMO 默认)
+                    'subject' → per-subject median split (平衡类别)
     """
 
     # ── 原生 DEAPDataset 模式 ──
     if mode == 'native':
-        # 使用固定缓存路径 (不含时间戳), 多次运行复用 LMDB
+        # 缓存路径: 含 label_mode 避免混合
         cache_root = os.path.join(os.path.dirname(run_dir), '_deap_cache')
         os.makedirs(cache_root, exist_ok=True)
-        io_path = os.path.join(cache_root, f'ccnn_de_{chunk_size}')
-        dataset = get_deap_dataset(io_path, chunk_size)
+        io_path = os.path.join(cache_root, f'ccnn_de_{chunk_size}_{label_mode}')
+        dataset = get_deap_dataset(io_path, chunk_size, label_mode)
 
         n_total = len(dataset)
         if verbose:
             print(f'\n[DEAP] CCNN-DE Dataset: {n_total} samples')
-            sample_labels = []
-            for i in range(min(1000, n_total)):
-                s = dataset[i]
-                lbl = s[1] if isinstance(s, (list, tuple)) else s['y']
-                sample_labels.append(int(lbl))
-            cls_counts = Counter(sample_labels)
-            print(f'       Class distribution (sample): {dict(cls_counts)}')
 
         # ── 将 LMDB 数据批量读入 tensor (避免 cv.split 复制 LMDB 崩溃) ──
         print(f'  Loading all data into memory...', flush=True)
@@ -278,7 +278,7 @@ def run_ccnn_experiment(
                 all_data.append(batch[0])
                 all_labels.append(batch[1].flatten())
         data = torch.cat(all_data, dim=0)
-        labels = torch.cat(all_labels, dim=0)
+        labels_continuous = torch.cat(all_labels, dim=0)  # 连续值 1-9
 
         # subject_ids: DEAPDataset 按 trial/受试者顺序排列
         # BaselineRemoval → 60s/trial, 1s窗口 → 60 windows/trial
@@ -292,9 +292,29 @@ def run_ccnn_experiment(
             end = (si + 1) * n_trials_per_subject * n_windows_per_trial
             subjects[start:end] = si + 1
 
+        # ── 二值化标签 ──
+        if label_mode == 'subject':
+            # Per-subject median split: 平衡类别
+            labels = torch.zeros(n_total, dtype=torch.long)
+            for si in range(1, n_subjects + 1):
+                sub_mask = subjects == si
+                sub_vals = labels_continuous[sub_mask]
+                median_val = sub_vals.median().item()
+                labels[sub_mask] = (labels_continuous[sub_mask] > median_val).long()
+            if verbose:
+                cls_counts = Counter(labels.tolist())
+                print(f'       Label mode: subject (per-subject median split)')
+                print(f'       Classes: {dict(cls_counts)}')
+        else:
+            # Global threshold 5.0 (TorchEEG EMO 默认, 但导致 ~79% 多数类)
+            labels = (labels_continuous > 5.0).long()
+            if verbose:
+                cls_counts = Counter(labels.tolist())
+                print(f'       Label mode: global (valence > 5.0 → high)')
+                print(f'       Classes: {dict(cls_counts)}')
+
         if verbose:
-            print(f'       Data shape: {tuple(data.shape)}, '
-                  f'Labels: {Counter(labels.tolist())}')
+            print(f'       Data shape: {tuple(data.shape)}')
 
         # 数据移到 GPU
         if device != 'cpu':
@@ -444,6 +464,10 @@ def run_ccnn_experiment(
     mean_acc = float(np.mean(val_accs))
     std_acc = float(np.std(val_accs))
 
+    # 目标准确率仅在 global 模式下有意义
+    effective_target = TARGET_ACC if label_mode == 'global' else 'N/A (subject mode)'
+    gap = round(TARGET_ACC - mean_acc, 2) if label_mode == 'global' else None
+
     summary = {
         'model': 'CCNN (DE)',
         'chunk_size': chunk_size,
@@ -455,6 +479,7 @@ def run_ccnn_experiment(
         'epochs_actual': actual_epochs,
         'early_patience': early_patience,
         'scheduler': scheduler_name,
+        'label_mode': label_mode,
         'num_params': sum(p.numel() for p in create_ccnn().parameters()),
         'preprocessing': 'BandDifferentialEntropy → ToGrid(9×9)',
         'input_shape': f'({CCNN_IN_CHANNELS}, {CCNN_GRID_SIZE[0]}, {CCNN_GRID_SIZE[1]})',
@@ -463,20 +488,23 @@ def run_ccnn_experiment(
         'mean_val_acc': round(mean_acc, 2),
         'std_val_acc': round(std_acc, 2),
         'best_val_acc': round(best_overall_acc, 2),
-        'target_acc': TARGET_ACC,
-        'gap_to_target': round(TARGET_ACC - mean_acc, 2),
+        'target_acc': effective_target,
+        'gap_to_target': gap,
     }
 
     if verbose:
         print(f'\n{"="*55}')
         print(f'  CCNN (DE) — {cv_strategy} ({n_folds}-fold)')
+        print(f'  Label: {label_mode.upper()}')
         print(f'  Input: {summary["input_shape"]} (DE features → 9×9 grid)')
         print(f'  Params: {summary["num_params"]:,}')
-        print(f'  Target: {TARGET_ACC}% (TorchEEG EMO Table 1)')
+        if label_mode == 'global':
+            print(f'  Target: {TARGET_ACC}% (TorchEEG EMO Table 1)')
         print(f'  Per-fold: {[f"{a:.2f}" for a in val_accs]}')
         print(f'  Mean±Std: {mean_acc:.2f}±{std_acc:.2f}')
         print(f'  Best:     {best_overall_acc:.2f}%')
-        print(f'  Gap:      {summary["gap_to_target"]:.2f}%')
+        if gap is not None:
+            print(f'  Gap:      {gap:.2f}%')
         print(f'{"="*55}')
 
     # ── 保存 ──
@@ -519,6 +547,9 @@ def main():
     parser.add_argument('--early-patience', type=int, default=15)
     parser.add_argument('--scheduler', type=str, default='cosine',
                         choices=['cosine', 'plateau', 'step'])
+    parser.add_argument('--label-mode', type=str, default='global',
+                        choices=['global', 'subject'],
+                        help='标签策略: global (>5.0) 或 subject (per-subject median split)')
     parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--results-dir', type=str, default=RESULTS_DIR)
     parser.add_argument('--test', action='store_true',
@@ -544,11 +575,16 @@ def main():
     print(f'    Scheduler:   {args.scheduler}')
     print(f'    Early stop:  patience={args.early_patience}')
     print(f'    Max epochs:  {args.epochs}')
+    print(f'    Label mode:  {args.label_mode}', end='')
+    if args.label_mode == 'global':
+        print(' (valence > 5.0 → high/low, 不均衡)')
+    else:
+        print(' (per-subject median split, 平衡)')
     print()
     print(f'  Data preprocessing:')
     print(f'    1. BandDifferentialEntropy (theta/alpha/beta/gamma)')
     print(f'    2. ToGrid(DEAP_CHANNEL_LOCATION_DICT) → ({CCNN_IN_CHANNELS}, 9, 9)')
-    print(f'    3. Label: valence > 5 → high, else → low')
+    print(f'    3. Label: {args.label_mode} mode')
     print()
 
     if device == 'cuda':
@@ -574,7 +610,8 @@ def main():
     window_label = f'{args.chunk_size}pt_{args.chunk_size/DEAP_SAMPLING_RATE:.0f}s'
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     test_label = '_TEST' if args.test else ''
-    run_name = f'{mode_label}_{window_label}_{cv_label}_{timestamp}{test_label}'
+    label_label = f'_{args.label_mode}'
+    run_name = f'{mode_label}_{window_label}_{cv_label}{label_label}_{timestamp}{test_label}'
     run_dir = os.path.join(args.results_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     print(f'[RESULT] {run_dir}')
@@ -603,6 +640,7 @@ def main():
         run_dir=run_dir,
         test_mode=args.test,
         verbose=verbose,
+        label_mode=args.label_mode,
     )
 
     # 输出最终结果
@@ -610,14 +648,19 @@ def main():
     print(f'  FINAL RESULT')
     print(f'{"="*55}')
     print(f'  CCNN (DE) | {args.cv} ({args.n_splits}-fold)')
-    print(f'  Mean Acc:  {summary["mean_val_acc"]:.2f}% ± {summary["std_val_acc"]:.2f}%')
-    print(f'  Best Acc:  {summary["best_val_acc"]:.2f}%')
-    print(f'  Target:    {TARGET_ACC}%')
-    print(f'  Gap:       {summary["gap_to_target"]:.2f}%')
-    if summary["gap_to_target"] <= 0:
-        print(f'  ✅ 目标达成! 超过 {abs(summary["gap_to_target"]):.2f}%')
+    print(f'  Label:    {args.label_mode.upper()}')
+    print(f'  Mean Acc: {summary["mean_val_acc"]:.2f}% ± {summary["std_val_acc"]:.2f}%')
+    print(f'  Best Acc: {summary["best_val_acc"]:.2f}%')
+    if args.label_mode == 'global':
+        print(f'  Target:   {TARGET_ACC}%')
+        gap = summary["gap_to_target"]
+        print(f'  Gap:      {gap:.2f}%')
+        if gap <= 0:
+            print(f'  ✅ 目标达成! 超过 {abs(gap):.2f}%')
+        else:
+            print(f'  ❌ 未达到目标, 差 {gap:.2f}%')
     else:
-        print(f'  ❌ 未达到目标, 差 {summary["gap_to_target"]:.2f}%')
+        print(f'  Note:  subject 模式下与 TorchEEG EMO 92.23% 不直接可比')
     print(f'{"="*55}')
     print(f'[DONE] Results saved to: {run_dir}')
 
