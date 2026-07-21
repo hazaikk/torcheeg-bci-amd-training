@@ -128,9 +128,10 @@ def get_ccnn_transforms():
     return offline_transform, online_transform, label_transform
 
 
-def get_deap_dataset(io_path: str, chunk_size: int = 128):
-    """创建 CCNN 专用 DEAPDataset"""
+def get_deap_dataset(cache_dir: str, chunk_size: int = 128):
+    """创建 CCNN 专用 DEAPDataset, 使用固定缓存路径复用 LMDB"""
     offline, online, label = get_ccnn_transforms()
+    os.makedirs(cache_dir, exist_ok=True)
     return DEAPDataset(
         root_path=DEFAULT_DEAP_DIR,
         chunk_size=chunk_size,
@@ -139,7 +140,7 @@ def get_deap_dataset(io_path: str, chunk_size: int = 128):
         offline_transform=offline,
         online_transform=online,
         label_transform=label,
-        io_path=io_path,
+        io_path=cache_dir,
         io_mode='lmdb',
         num_worker=0,
         verbose=True,
@@ -247,8 +248,10 @@ def run_ccnn_experiment(
 
     # ── 原生 DEAPDataset 模式 ──
     if mode == 'native':
-        dataset_name = f'ccnn_de_{chunk_size}'
-        io_path = os.path.join(run_dir, f'_deap_cache_{dataset_name}')
+        # 使用固定缓存路径 (不含时间戳), 多次运行复用 LMDB
+        cache_root = os.path.join(os.path.dirname(run_dir), '_deap_cache')
+        os.makedirs(cache_root, exist_ok=True)
+        io_path = os.path.join(cache_root, f'ccnn_de_{chunk_size}')
         dataset = get_deap_dataset(io_path, chunk_size)
 
         n_total = len(dataset)
