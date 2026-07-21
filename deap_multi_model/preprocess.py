@@ -1,12 +1,14 @@
 """
-DEAP 数据集预处理 — 支持多类型模型 (Transformer/RNN/GNN/Lightweight)
+DEAP 数据集预处理 — 支持多类型模型 (Transformer/RNN/GNN/Lightweight/CNN)
 
 为每个模型生成对应输入形状的 .pt 文件:
 
-  4D 通用 (1,32,T)    → Conformer, LMDA, CSPNet, LGGNet
-  3D 时序 (32,T)       → VanillaTransformer, LSTM, GRU
-  3D 节点特征 (32,F)   → DGCNN
-  4D 网格 (T,9,9)      → STNet
+  4D 通用 (1,32,T)       → Conformer, LMDA, CSPNet, LGGNet, TSLANet
+  3D 时序 (32,T)          → VanillaTransformer, LSTM, GRU
+  3D 节点特征 (32,F)      → DGCNN
+  4D 网格 (T,9,9)         → STNet
+  4D 特征网格 (8,8,9)     → MTCNN
+  4D 特征网格 (36,16,16)  → SSTEmotionNet
 
 用法:
     python preprocess.py --models all
@@ -19,6 +21,7 @@ import sys
 import time
 import pickle
 import argparse
+import warnings
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -26,12 +29,21 @@ import torch
 from scipy.signal import butter, sosfilt
 
 from torcheeg import transforms as T
-from torcheeg.datasets.constants import DEAP_CHANNEL_LOCATION_DICT
+from torcheeg.datasets.constants import (
+    DEAP_CHANNEL_LOCATION_DICT,
+    DEAP_CHANNEL_LIST,
+)
 
 from config import *
+from utils import format_channel_location_dict
 
-# ── 频带定义 ──
-FBC_BANDS = {f'band{i}': [4 * i, 4 * (i + 1)] for i in range(1, 10)}
+warnings.filterwarnings('ignore')
+
+
+# ── MTCNN 专用 8×9 电极布局 → location dict ──
+MTCNN_LOCATION_DICT = format_channel_location_dict(
+    DEAP_CHANNEL_LIST, MTCNN_GRID_8x9,
+)
 
 
 def get_transform(model_name: str) -> callable:
@@ -45,7 +57,8 @@ def get_transform(model_name: str) -> callable:
         return T.Compose([T.To2d(), T.ToTensor()])
 
     # ── Group 2: 3D 时序输入 (32, T) ──
-    elif model_name in ('VanillaTransformer', 'LSTM', 'GRU'):
+    # TSLANet 期望 (batch, num_electrodes, chunk_size) = (32, 128)
+    elif model_name in ('VanillaTransformer', 'LSTM', 'GRU', 'TSLANet'):
         return T.Compose([T.ToTensor()])
 
     # ── Group 3: 节点特征输入 (32, F) — 需后处理 ──
@@ -61,6 +74,39 @@ def get_transform(model_name: str) -> callable:
         return T.Compose([
             T.ToGrid(DEAP_CHANNEL_LOCATION_DICT),
             T.ToTensor(),
+        ])
+
+    # ── Group 5: MTCNN — DE + PSD → Concatenate → ToGrid(8×9) ──
+    elif model_name == 'MTCNN':
+        return T.Compose([
+            T.Concatenate([
+                T.Compose([
+                    T.BandDifferentialEntropy(sampling_rate=DEAP_SAMPLING_RATE),
+                ]),
+                T.Compose([
+                    T.BandPowerSpectralDensity(sampling_rate=DEAP_SAMPLING_RATE),
+                ]),
+            ]),
+            T.ToGrid(MTCNN_LOCATION_DICT),
+            T.ToTensor(),
+        ])
+
+    # ── Group 6: SSTEmotionNet — DE + Downsample → Concatenate → ToInterpolatedGrid → Resize ──
+    elif model_name == 'SSTEmotionNet':
+        return T.Compose([
+            T.Concatenate([
+                T.Compose([
+                    T.BandDifferentialEntropy(sampling_rate=DEAP_SAMPLING_RATE),
+                    T.MeanStdNormalize(),
+                ]),
+                T.Compose([
+                    T.Downsample(num_points=32),
+                    T.MinMaxNormalize(),
+                ]),
+            ]),
+            T.ToInterpolatedGrid(DEAP_CHANNEL_LOCATION_DICT),
+            T.ToTensor(),
+            T.Resize(size=(16, 16)),
         ])
 
     else:
@@ -81,31 +127,14 @@ def _bandpass_trials(trials_data: np.ndarray,
             for ch in range(trials_data.shape[1]):
                 filtered[ti, ch] = sosfilt(sos, trials_data[ti, ch])
         results[band_name] = filtered
-        print(f'    {band_name} ({low}-{high}Hz): filtered {trials_data.shape}',
-              flush=True)
     return results
 
 
 def postprocess_dgcnn(transformed: torch.Tensor) -> torch.Tensor:
-    """DGCNN 后处理: (N, 9, 32, T) → 时域方差 → (N, 32, 9)
-
-    原始 transform 输出 (9, 32, T) 的 BandSignal 结果,
-    压缩时间维度为方差特征, 转置为 (32, 9) 作为节点特征.
-    """
-    # transformed: (N, 9, 32, T)
+    """DGCNN 后处理: (N, 9, 32, T) → 时域方差 → (N, 32, 9)"""
     var = transformed.var(dim=3, keepdim=False)  # (N, 9, 32)
     result = var.permute(0, 2, 1)  # (N, 32, 9)
     return result.contiguous()
-
-
-def postprocess_stnet(transformed: torch.Tensor,
-                      chunk_size: int) -> torch.Tensor:
-    """STNet 后处理: 确保输出形状为 (N, T, 9, 9)"""
-    if transformed.dim() == 4 and transformed.shape[1] != chunk_size:
-        # 需要调整维度顺序
-        if transformed.shape[-1] == 9 and transformed.shape[-2] == 9:
-            pass  # 已经是 (N, T, 9, 9)
-    return transformed.contiguous()
 
 
 def precompute_model_data(windows: np.ndarray,
@@ -133,14 +162,12 @@ def precompute_model_data(windows: np.ndarray,
         print(f'[PREP] DGCNN: computing band features...', flush=True)
 
         if full_trials is not None:
-            # 快速路径: 对完整 trials 滤波
             n_trials = full_trials.shape[0]
             band_data = _bandpass_trials(full_trials, FBC_BANDS,
                                          sampling_rate=DEAP_SAMPLING_RATE)
 
             n_bands = len(band_data)
             n_ch = full_trials.shape[1]
-            # 切窗计算每窗口的方差
             n_total = n_trials * n_windows_per_trial
             band_var = np.zeros((n_total, n_bands, n_ch), dtype=np.float32)
 
@@ -150,41 +177,31 @@ def precompute_model_data(windows: np.ndarray,
                     for wi in range(n_windows_per_trial):
                         start = wi * DEAP_CHUNK_SIZE
                         end = start + DEAP_CHUNK_SIZE
-                        seg = fdata[ti, :, start:end]  # (32, chunk_size)
+                        seg = fdata[ti, :, start:end]
                         band_var[idx, bi] = seg.var(axis=1)
                         idx += 1
-
-            # (N, 32, 9)
             result = torch.from_numpy(band_var.transpose(0, 2, 1)).float()
         else:
-            # 通用路径: 对已切窗数据逐个处理
             n = len(windows)
             all_var = []
-            log_interval = max(1, n // 10)
-
             for i in range(0, n, batch_size):
                 batch = windows[i:i + batch_size]
                 batch_var = []
                 for sample in batch:
-                    # 对每个窗口做 BandSignal
                     result_bs = T.BandSignal(sampling_rate=DEAP_SAMPLING_RATE,
                                               band_dict=FBC_BANDS)(eeg=sample)
                     bs_tensor = T.ToTensor()(eeg=result_bs['eeg'])['eeg']
-                    # bs_tensor: (9, 32, chunk_size)
-                    var = bs_tensor.var(dim=2)  # (9, 32)
-                    batch_var.append(var.permute(1, 0))  # (32, 9)
+                    var = bs_tensor.var(dim=2)
+                    batch_var.append(var.permute(1, 0))
                 all_var.append(torch.stack(batch_var))
-
                 processed = min(i + batch_size, n)
-                if processed % log_interval == 0:
+                if processed % max(1, n // 10) == 0:
                     print(f'  [{processed}/{n}]', flush=True)
-
             result = torch.cat(all_var, dim=0)
 
         elapsed = time.time() - t0
         print(f'[PREP] DGCNN done ({elapsed:.1f}s), '
               f'shape={tuple(result.shape)}', flush=True)
-
         if device != 'cpu':
             result = result.to(device)
         return result.float()
@@ -303,8 +320,10 @@ def process_all(data_dir: str,
     # ── 二值化标签 ──
     labels_binary = (expanded_labels_v > 5.0).astype(np.int64)
     print(f'[PREP] Total: {n_total_windows} windows')
-    print(f'       Class 0 (low):  {(labels_binary==0).sum()}')
-    print(f'       Class 1 (high): {(labels_binary==1).sum()}')
+    cls0 = (labels_binary == 0).sum()
+    cls1 = (labels_binary == 1).sum()
+    print(f'       Class 0 (low):  {cls0} ({cls0/n_total_windows*100:.1f}%)')
+    print(f'       Class 1 (high): {cls1} ({cls1/n_total_windows*100:.1f}%)')
 
     # ── 保存元数据 ──
     meta = {
@@ -326,7 +345,7 @@ def process_all(data_dir: str,
     results = {}
     for model_name in model_names:
         print(f'\n--- {model_name} ---')
-        # DGCNN 和 STNet 需要特殊后处理
+
         if model_name == 'DGCNN':
             transformed = precompute_model_data(
                 windows, model_name, device=device,
@@ -339,6 +358,16 @@ def process_all(data_dir: str,
         torch.save(transformed.contiguous(), data_path)
         print(f'[PREP] Saved: {data_path}  shape={tuple(transformed.shape)}')
         results[model_name] = data_path
+
+    # 打印模型输入形状汇总
+    print(f'\n{"="*55}')
+    print(f'  模型输入形状汇总')
+    print(f'{"="*55}')
+    for model_name in model_names:
+        data_path = os.path.join(preproc_dir, f'{model_name}_data.pt')
+        if os.path.exists(data_path):
+            t = torch.load(data_path, map_location='cpu', weights_only=True)
+            print(f'  {model_name:25s} → {str(tuple(t.shape)):20s}')
 
     print(f'\n[PREP] All done! Files in: {preproc_dir}')
     return results

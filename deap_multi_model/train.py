@@ -1,13 +1,15 @@
 """
 DEAP 多类型模型训练脚本
 
-支持模型: Conformer, VanillaTransformer, LSTM, GRU, DGCNN, LGGNet, STNet, LMDA, CSPNet
+支持模型: Conformer, VanillaTransformer, LSTM, GRU, DGCNN, LGGNet, STNet,
+         LMDA, CSPNet, MTCNN, SSTEmotionNet, TSLANet
 
 用法:
     python train.py --models Conformer LMDA
     python train.py --models all --gpu
     python train.py --models LSTM --lr 0.0005 --batch-size 64
     python train.py --models all --chunk-size 256
+    python train.py --models MTCNN SSTEmotionNet TSLANet --gpu
 """
 
 import os
@@ -105,6 +107,20 @@ def create_model(model_name: str, num_classes: int = 2) -> nn.Module:
         from torcheeg.models import CSPNet
         return CSPNet(**params)
 
+    # ═══════ 新增模型 ═══════
+
+    elif model_name == 'MTCNN':
+        from torcheeg.models import MTCNN
+        return MTCNN(**params)
+
+    elif model_name == 'SSTEmotionNet':
+        from torcheeg.models import SSTEmotionNet
+        return SSTEmotionNet(**params)
+
+    elif model_name == 'TSLANet':
+        from torcheeg.models import TSLANet
+        return TSLANet(**params)
+
     else:
         raise ValueError(f'Unknown model: {model_name}')
 
@@ -114,11 +130,20 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def get_criterion(model_name: str) -> nn.Module:
+    """获取损失函数
+
+    MTCNN 多任务输出 (valence, arousal), 仅用 valence 计算损失
+    """
+    return nn.CrossEntropyLoss()
+
+
 # =====================================
 # 训练 & 评估
 # =====================================
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device):
+    """训练一个 epoch, 支持 MTCNN 多任务输出"""
     model.train()
     running_loss = 0.0
     correct = 0
@@ -135,6 +160,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
 
         optimizer.zero_grad()
         outputs = model(inputs)
+
+        # MTCNN 返回 (valence_logits, arousal_logits) 元组
+        if isinstance(outputs, (tuple, list)):
+            outputs = outputs[0]  # 取 valence 输出
+
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -148,6 +178,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
 
 
 def evaluate(model, dataloader, criterion, device):
+    """评估, 支持 MTCNN 多任务输出"""
     model.eval()
     running_loss = 0.0
     all_preds, all_labels = [], []
@@ -162,6 +193,11 @@ def evaluate(model, dataloader, criterion, device):
             inputs = inputs.to(device)
             labels = labels.to(device).long()
             outputs = model(inputs)
+
+            # MTCNN 返回 (valence_logits, arousal_logits) 元组
+            if isinstance(outputs, (tuple, list)):
+                outputs = outputs[0]  # 取 valence 输出
+
             loss = criterion(outputs, labels)
 
             running_loss += loss.item()
@@ -267,9 +303,19 @@ def run_experiment(
         # 创建模型
         model = create_model(model_name, num_classes=DEAP_NUM_CLASSES)
         model = model.to(device)
-        criterion = nn.CrossEntropyLoss()
+        criterion = get_criterion(model_name)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        # SSTEmotionNet 显存大, 用小批量
+        if model_name == 'SSTEmotionNet' and batch_size > 64:
+            if verbose:
+                print(f'  [INFO] SSTEmotionNet: reducing batch_size to 64')
+            train_loader = DataLoader(train_ds, batch_size=64,
+                                      shuffle=True, num_workers=0)
+            val_loader = DataLoader(val_ds, batch_size=64,
+                                    shuffle=False, num_workers=0)
+
         scheduler = create_scheduler(optimizer, scheduler_name, actual_epochs)
         early_stopping = EarlyStopping(
             patience=early_patience, mode='max', verbose=verbose)
@@ -462,7 +508,6 @@ def main():
 
         all_summaries.append(summary)
 
-        # 跨 GPU 清理
         if device != 'cpu':
             torch.cuda.empty_cache()
 

@@ -119,6 +119,41 @@ class CCNNParams:
     dropout: float = 0.5
 
 
+# ── MTCNN 配置 ──
+@dataclass
+class MTCNNParams:
+    in_channels: int = 8
+    grid_size: tuple = (8, 9)
+    dropout: float = 0.2
+
+
+# ── SSTEmotionNet 配置 ──
+@dataclass
+class SSTEmotionNetParams:
+    grid_size: tuple = (16, 16)
+    spectral_in_channels: int = 4
+    temporal_in_channels: int = 32
+    spectral_depth: int = 16
+    temporal_depth: int = 22
+    spectral_growth_rate: int = 12
+    temporal_growth_rate: int = 24
+    num_dense_block: int = 3
+    hid_channels: int = 50
+    densenet_dropout: float = 0.0
+    task_dropout: float = 0.0
+
+
+# ── TSLANet 配置 ──
+@dataclass
+class TSLANetParams:
+    chunk_size: int = 128
+    patch_size: int = 16
+    num_electrodes: int = 32
+    emb_dim: int = 64
+    dropout_rate: float = 0.15
+    depth: int = 2
+
+
 # =============================================
 # DEAP 数据集配置
 # =============================================

@@ -131,9 +131,9 @@ run_training() {
     echo ""
 }
 
-# ── 3b. DEAP 训练 ──
+# ── 3b. DEAP 训练 (CNN 基线) ──
 run_deap_training() {
-    echo "[3/5] Training DEAP models..."
+    echo "[3/5] Training DEAP CNN baseline models..."
 
     # 下载 DEAP 数据集 (如果尚未下载)
     if [ ! -f "data/deap/s01.dat" ]; then
@@ -150,7 +150,7 @@ run_deap_training() {
         --output-dir data/deap_preprocessed
 
     # 训练
-    echo "  Training DEAP models (Table 1 reproduction)..."
+    echo "  Training DEAP CNN models (Table 1 reproduction)..."
     python train_deap.py \
         --models EEGNet TSCeption FBCNet FBMSNet CCNN \
         --chunk-size 128 \
@@ -158,6 +158,78 @@ run_deap_training() {
         --use-preprocessed \
         --preproc-dir data/deap_preprocessed \
         --epochs 100
+    echo ""
+}
+
+# ── 3c. 多类型模型训练 (含新增的 MTCNN, SSTEmotionNet, TSLANet) ──
+run_deap_multi_model() {
+    echo "[3/5] Training DEAP multi-model comparison..."
+
+    # 下载 DEAP 数据集
+    if [ ! -f "data/deap/s01.dat" ]; then
+        echo "  Downloading DEAP dataset..."
+        python download_deap.py --data-dir data/deap
+    fi
+
+    cd deap_multi_model
+
+    # 预处理所有模型
+    echo "  Preprocessing all models (including MTCNN, SSTEmotionNet, TSLANet)..."
+    python preprocess.py \
+        --models Conformer VanillaTransformer LSTM GRU DGCNN LGGNet STNet LMDA CSPNet MTCNN SSTEmotionNet TSLANet \
+        --chunk-size 128 \
+        --data-dir ../data/deap \
+        --output-dir ../data/deap_preprocessed_mm \
+        --gpu
+
+    # 训练所有模型
+    echo "  Training all models..."
+    python train.py \
+        --models Conformer VanillaTransformer LSTM GRU DGCNN LGGNet STNet LMDA CSPNet MTCNN SSTEmotionNet TSLANet \
+        --chunk-size 128 \
+        --cv kfold_groupby_trial \
+        --preproc-dir ../data/deap_preprocessed_mm \
+        --gpu \
+        --epochs 200
+
+    cd ..
+    echo ""
+}
+
+# ── 3d. CCNN 复现训练 (DE 特征, 目标 92.23%) ──
+run_ccnn_repro() {
+    echo "[3/5] Running CCNN reproduction experiment..."
+
+    # 下载 DEAP 数据集
+    if [ ! -f "data/deap/s01.dat" ]; then
+        echo "  Downloading DEAP dataset..."
+        python download_deap.py --data-dir data/deap
+    fi
+
+    # 使用 TorchEEG 原生 DEAPDataset (自动 DE 预处理)
+    echo "  Training CCNN with DE features (target: 92.23%)..."
+    python train_ccnn_repro.py \
+        --mode native \
+        --cv kfold_groupby_trial \
+        --chunk-size 128 \
+        --batch-size 128 \
+        --lr 0.001 \
+        --epochs 200 \
+        --early-patience 15 \
+        --gpu
+
+    # 也尝试 LOSO 模式 (与 TorchEEG EMO 论文更一致的评估方式)
+    echo "  Training CCNN with DE features (LOSO, target: 92.23%)..."
+    python train_ccnn_repro.py \
+        --mode native \
+        --cv leave_one_subject_out \
+        --chunk-size 128 \
+        --batch-size 128 \
+        --lr 0.001 \
+        --epochs 200 \
+        --early-patience 15 \
+        --gpu
+
     echo ""
 }
 
@@ -224,6 +296,26 @@ case "$MODE" in
         detect_env
         install_deps
         run_deap_training
+        show_results
+        ;;
+    deap-multi)
+        detect_env
+        install_deps
+        run_deap_multi_model
+        show_results
+        ;;
+    ccnn-repro)
+        detect_env
+        install_deps
+        run_ccnn_repro
+        show_results
+        ;;
+    mm)  # 简写: 运行所有 DEAP 相关实验
+        detect_env
+        install_deps
+        run_deap_training
+        run_deap_multi_model
+        run_ccnn_repro
         show_results
         ;;
     test)

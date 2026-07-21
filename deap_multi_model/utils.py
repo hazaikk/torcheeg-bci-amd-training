@@ -1,9 +1,11 @@
 """
-工具模块: 训练策略 + scipy 兼容性修复
+工具模块: 训练策略 + scipy 兼容性修复 + 辅助函数
 """
 
 import math
 import warnings
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import scipy.signal
@@ -15,6 +17,27 @@ scipy.signal.hamming = hamming
 scipy.signal.blackman = blackman
 
 warnings.filterwarnings('ignore')
+
+
+def format_channel_location_dict(
+    channel_list: List[str],
+    location_list: List[List[str]],
+) -> Dict[str, Tuple[int, int]]:
+    """将电极名称列表 + 布局网格转换为 TorchEEG 的 location dict
+
+    Args:
+        channel_list: 电极名称列表, 如 ['FP1', 'AF3', 'F7', ...]
+        location_list: 二维网格布局, 每个位置是电极名或 '-'
+
+    Returns:
+        Dict[str, Tuple[int, int]]: {channel_name: (row, col)}
+    """
+    location_dict = {}
+    for row_idx, row in enumerate(location_list):
+        for col_idx, ch_name in enumerate(row):
+            if ch_name != '-' and ch_name in channel_list:
+                location_dict[ch_name] = (row_idx, col_idx)
+    return location_dict
 
 
 class EarlyStopping:
